@@ -1,0 +1,363 @@
+% =========================================================================
+% COMSOL-MATLAB: CCCV & MSCC 동시 최적화 + 전 점 기반 파레토 전선 (T vs s)
+% 최종 완성본 - 온도 제약 제외, 안전여유 s=min(phis-phil)
+% =========================================================================
+clc; clear; close all;
+import com.comsol.model.*
+import com.comsol.model.util.*
+
+%% 0) 공통 설정/파일 정리
+% 로그 파일 초기화 (매 평가마다 누적 기록)
+if exist('cccv_optimization_log.csv','file'); delete('cccv_optimization_log.csv'); end
+if exist('mscc_optimization_log.csv','file'); delete('mscc_optimization_log.csv'); end
+
+% 모델 불러오기
+filepath = 'C:\Users\dsdsd\Downloads';
+filename = 'ES_MSCC_PC_1015.mph';     % 사용자 모델 파일명
+full_path = fullfile(filepath, filename);
+model = mphload(full_path);
+ModelUtil.showProgress(true);
+disp('모델 불러오기 완료.');
+
+% 색상
+blue_color  = [0, 115, 194]/255;  % CCCV
+red_color   = [205, 83, 76]/255;  % MSCC
+gray_color  = 0.75*[1 1 1];
+
+% 안전여유 경계 (네 코드와 동일하게 0.02 V 사용)
+safety_eps = 0.02;   % [V]
+
+% 최적화 평가 횟수
+N_EVALS = 10;   % surrogateopt MaxFunctionEvaluations
+
+% =========================================================================
+% PART 1: CCCV 최적화 (단일 변수: C_rate)
+%   목적: 충전시간 T 최소화
+%   제약: s=min(phis-phil) > safety_eps (위반시 T에 큰 패널티)
+%   매 평가마다 [C_rate, T, s]를 cccv_optimization_log.csv에 기록
+% =========================================================================
+disp('===== PART 1: CCCV 최적화를 시작합니다 =====');
+lb_cccv = 0.1; 
+ub_cccv = 6.0; 
+obj_cccv = @(C) evaluate_cccv(C, model, safety_eps);  % 아래 로컬함수
+
+opts_cccv = optimoptions('surrogateopt', ...
+    'MaxFunctionEvaluations', N_EVALS, ...  % 총 평가 횟수 (여기=100)
+    'Display','iter', ...
+    'PlotFcn','surrogateoptplot');          % 수렴/탐색 상황 플롯
+
+[optimal_C_rate, cccv_min_time, exitflag_cccv, output_cccv, trials_cccv] = ...
+    surrogateopt(obj_cccv, lb_cccv, ub_cccv, opts_cccv);
+
+fprintf('\n--- CCCV 최적화 결과 ---\n');
+fprintf('최적 CCCV 충전 시간: %.2f s\n', cccv_min_time);
+fprintf('최적 C-rate: %.2f C\n\n', optimal_C_rate);
+
+% =========================================================================
+% PART 2: MSCC 최적화 (다변수: C1..C4)
+%   목적: 충전시간 T 최소화
+%   제약: s=min(phis-phil) > safety_eps (위반시 T에 큰 패널티)
+%   매 평가마다 [C1..C4, T, s]를 mscc_optimization_log.csv에 기록
+% =========================================================================
+disp('===== PART 2: MSCC 최적화를 시작합니다 =====');
+lb_mscc = [0.1, 0.1, 0.1, 0.1];
+ub_mscc = [6.0, 6.0, 6.0, 6.0];
+obj_mscc = @(C) evaluate_mscc(C, model, safety_eps);  % 아래 로컬함수
+
+opts_mscc = optimoptions('surrogateopt', ...
+    'MaxFunctionEvaluations', N_EVALS, ...  % 총 평가 횟수 (여기=100)
+    'Display','iter', ...
+    'PlotFcn','surrogateoptplot');
+
+[optimal_C_mscc, mscc_min_time, exitflag_mscc, output_mscc, trials_mscc] = ...
+    surrogateopt(obj_mscc, lb_mscc, ub_mscc, opts_mscc);
+
+fprintf('\n--- MSCC 최적화 결과 ---\n');
+fprintf('최적 MSCC 충전 시간: %.2f s\n', mscc_min_time);
+fprintf('최적 C-rate 조합: C1=%.2f, C2=%.2f, C3=%.2f, C4=%.2f\n\n', ...
+    optimal_C_mscc(1), optimal_C_mscc(2), optimal_C_mscc(3), optimal_C_mscc(4));
+
+% =========================================================================
+% PART 3: (옵션) 최적해 시계열 한번 실행/저장
+% =========================================================================
+disp('--- 최적해 시계열 실행/저장 (요약) ---');
+expressions = {'t','phis-phil','SOC','E_cell','liion.cdc1.Icell','liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
+
+% CCCV
+model.param.set('C_rate', num2str(optimal_C_rate));
+model.study('std1').run();
+data_cccv = mpheval(model, expressions, 'dataset','dset1','edim','point','selection',2,'solnum','all');
+charge_idx_cccv = (data_cccv.d6==1) | (data_cccv.d7==1);
+time_cccv_chg = data_cccv.d1(charge_idx_cccv);
+Vdiff_cccv_chg= data_cccv.d2(charge_idx_cccv);
+
+% MSCC
+model.param.set('first_MSCC_Crate',  num2str(optimal_C_mscc(1)));
+model.param.set('second_MSCC_Crate', num2str(optimal_C_mscc(2)));
+model.param.set('third_MSCC_Crate',  num2str(optimal_C_mscc(3)));
+model.param.set('fourth_MSCC_Crate', num2str(optimal_C_mscc(4)));
+model.study('std2').run();
+data_mscc = mpheval(model, expressions, 'dataset','dset3','edim','point','selection',2,'solnum','all');
+charge_idx_mscc = (data_mscc.d6==1) | (data_mscc.d7==1);
+time_mscc_chg  = data_mscc.d1(charge_idx_mscc);
+Vdiff_mscc_chg = data_mscc.d2(charge_idx_mscc);
+
+% 간단한 시간-과전압 비교
+figure(10); clf; hold on; grid on;
+plot(time_cccv_chg, Vdiff_cccv_chg, 'Color', blue_color, 'LineWidth', 1.4);
+plot(time_mscc_chg, Vdiff_mscc_chg, 'Color', red_color,  'LineWidth', 1.4);
+xlabel('t (s)'); ylabel('phis-phil (V)');
+title('최적해 비교: 시간-과전압');
+legend('CCCV(opt)','MSCC(opt)','Location','best');
+set(gca,'FontSize',11);
+
+% =========================================================================
+% PART 4: 파레토 전선 (전 점 기반, 각 100점) - CCCV, MSCC, Combined
+%   - 로그 파일에서 모든 평가 점을 읽어 파레토 계산
+%   - 목적1: T 최소화, 목적2: s 최대화 (→ F=[T, -s])
+% =========================================================================
+disp('===== PART 4: Pareto front (모든 평가점 기반) =====');
+
+% --- 4.1) CCCV: 로그 로드 & 파레토 ---
+if ~exist('cccv_optimization_log.csv','file')
+    error('cccv_optimization_log.csv 파일이 없습니다. evaluate_cccv에서 기록이 안 되었을 수 있습니다.');
+end
+L_cccv = readmatrix('cccv_optimization_log.csv');   % [C_rate, T, s]
+if size(L_cccv,2) < 3
+    error('CCCV 로그 형식 오류: [C_rate, T, s] 3열이어야 합니다.');
+end
+C_cccv_all = L_cccv(:,1);
+T_cccv_all = L_cccv(:,2);
+s_cccv_all = L_cccv(:,3);
+
+% 비지배해 마스크
+mask_nd_cccv = isNondominated([T_cccv_all, -s_cccv_all]);  % 아래 로컬함수
+T_cccv_nd = T_cccv_all(mask_nd_cccv);
+s_cccv_nd = s_cccv_all(mask_nd_cccv);
+C_cccv_nd = C_cccv_all(mask_nd_cccv);
+[~,ord] = sort(T_cccv_nd,'ascend');
+T_cccv_nd = T_cccv_nd(ord); s_cccv_nd = s_cccv_nd(ord); C_cccv_nd = C_cccv_nd(ord);
+
+% 플롯 (개별)
+figure(60); clf; hold on; grid on;
+scatter(T_cccv_all, s_cccv_all, 36, gray_color, 'filled','DisplayName','CCCV 샘플(전점)');
+plot(T_cccv_nd, s_cccv_nd, '-o', 'Color', blue_color, 'LineWidth',1.8, 'DisplayName','CCCV Pareto');
+xlabel('충전시간 T (s)'); ylabel('안전여유 s = min(\phi_s-\phi_l) (V)');
+title('CCCV Pareto front (전 점 기반)');
+legend('Location','best'); set(gca,'FontSize',11);
+
+% 대표 3점
+[i_fast_cccv, i_safe_cccv, i_knee_cccv] = pick3(T_cccv_nd, s_cccv_nd);
+if ~isempty(i_fast_cccv)
+    scatter(T_cccv_nd([i_fast_cccv i_safe_cccv i_knee_cccv]), ...
+            s_cccv_nd([i_fast_cccv i_safe_cccv i_knee_cccv]), 90,'k','p','filled','DisplayName','대표3점');
+    fprintf('--- CCCV Pareto 대표3점 ---\n');
+    fprintf(' Fastest: T=%.2f s, s=%.4f V, C=%.2f C\n', T_cccv_nd(i_fast_cccv), s_cccv_nd(i_fast_cccv), C_cccv_nd(i_fast_cccv));
+    fprintf(' Safest : T=%.2f s, s=%.4f V, C=%.2f C\n', T_cccv_nd(i_safe_cccv), s_cccv_nd(i_safe_cccv), C_cccv_nd(i_safe_cccv));
+    fprintf(' Knee   : T=%.2f s, s=%.4f V, C=%.2f C\n', T_cccv_nd(i_knee_cccv), s_cccv_nd(i_knee_cccv), C_cccv_nd(i_knee_cccv));
+end
+
+% --- 4.2) MSCC: 로그 로드 & 파레토 ---
+if ~exist('mscc_optimization_log.csv','file')
+    error('mscc_optimization_log.csv 파일이 없습니다. evaluate_mscc에서 기록이 안 되었을 수 있습니다.');
+end
+L_mscc = readmatrix('mscc_optimization_log.csv');  % [C1 C2 C3 C4 T s]
+if size(L_mscc,2) < 6
+    error('MSCC 로그 형식 오류: [C1 C2 C3 C4 T s] 6열이어야 합니다.');
+end
+C_mscc_all = L_mscc(:,1:4);
+T_mscc_all = L_mscc(:,5);
+s_mscc_all = L_mscc(:,6);
+
+% 비지배해 마스크
+mask_nd_mscc = isNondominated([T_mscc_all, -s_mscc_all]);
+T_mscc_nd = T_mscc_all(mask_nd_mscc);
+s_mscc_nd = s_mscc_all(mask_nd_mscc);
+C_mscc_nd = C_mscc_all(mask_nd_mscc,:);
+[~,ord] = sort(T_mscc_nd,'ascend');
+T_mscc_nd = T_mscc_nd(ord); s_mscc_nd = s_mscc_nd(ord); C_mscc_nd = C_mscc_nd(ord,:);
+
+% 플롯 (개별)
+figure(61); clf; hold on; grid on;
+scatter(T_mscc_all, s_mscc_all, 36, gray_color, 'filled','DisplayName','MSCC 샘플(전점)');
+plot(T_mscc_nd, s_mscc_nd, '-o', 'Color', red_color, 'LineWidth',1.8, 'DisplayName','MSCC Pareto');
+xlabel('충전시간 T (s)'); ylabel('안전여유 s = min(\phi_s-\phi_l) (V)');
+title('MSCC Pareto front (전 점 기반)');
+legend('Location','best'); set(gca,'FontSize',11);
+
+% 대표 3점
+[i_fast_mscc, i_safe_mscc, i_knee_mscc] = pick3(T_mscc_nd, s_mscc_nd);
+if ~isempty(i_fast_mscc)
+    scatter(T_mscc_nd([i_fast_mscc i_safe_mscc i_knee_mscc]), ...
+            s_mscc_nd([i_fast_mscc i_safe_mscc i_knee_mscc]), 90,'k','s','filled','DisplayName','대표3점');
+    fprintf('--- MSCC Pareto 대표3점 ---\n');
+    fprintf(' Fastest: T=%.2f s, s=%.4f V, C=[%.2f %.2f %.2f %.2f]\n', ...
+        T_mscc_nd(i_fast_mscc), s_mscc_nd(i_fast_mscc), C_mscc_nd(i_fast_mscc,1), C_mscc_nd(i_fast_mscc,2), C_mscc_nd(i_fast_mscc,3), C_mscc_nd(i_fast_mscc,4));
+    fprintf(' Safest : T=%.2f s, s=%.4f V, C=[%.2f %.2f %.2f %.2f]\n', ...
+        T_mscc_nd(i_safe_mscc), s_mscc_nd(i_safe_mscc), C_mscc_nd(i_safe_mscc,1), C_mscc_nd(i_safe_mscc,2), C_mscc_nd(i_safe_mscc,3), C_mscc_nd(i_safe_mscc,4));
+    fprintf(' Knee   : T=%.2f s, s=%.4f V, C=[%.2f %.2f %.2f %.2f]\n', ...
+        T_mscc_nd(i_knee_mscc), s_mscc_nd(i_knee_mscc), C_mscc_nd(i_knee_mscc,1), C_mscc_nd(i_knee_mscc,2), C_mscc_nd(i_knee_mscc,3), C_mscc_nd(i_knee_mscc,4));
+end
+
+% --- 4.3) Combined plot (CCCV vs MSCC) ---
+figure(62); clf; hold on; grid on;
+scatter(T_cccv_all, s_cccv_all, 30, blue_color, 'o','MarkerFaceColor',blue_color*0.3,'DisplayName','CCCV 샘플');
+scatter(T_mscc_all, s_mscc_all, 30, red_color,  'o','MarkerFaceColor',red_color*0.3, 'DisplayName','MSCC 샘플');
+plot(T_cccv_nd, s_cccv_nd, '-o', 'Color', blue_color, 'LineWidth',1.8, 'DisplayName','CCCV Pareto');
+plot(T_mscc_nd, s_mscc_nd, '-o', 'Color', red_color,  'LineWidth',1.8, 'DisplayName','MSCC Pareto');
+xlabel('충전시간 T (s)'); ylabel('안전여유 s = min(\phi_s-\phi_l) (V)');
+title('CCCV vs MSCC: Pareto front (전 점 기반)');
+legend('Location','best'); set(gca,'FontSize',11);
+
+% =========================================================================
+% PART 5: 결과 저장
+% =========================================================================
+date_string  = datestr(now, 'yyyymmdd');
+save_filename = ['Optimization_And_Pareto_' date_string '.mat'];
+save(save_filename, ...
+    'optimal_C_rate','cccv_min_time','trials_cccv','exitflag_cccv','output_cccv', ...
+    'optimal_C_mscc','mscc_min_time','trials_mscc','exitflag_mscc','output_mscc', ...
+    'T_cccv_all','s_cccv_all','C_cccv_all','T_cccv_nd','s_cccv_nd','C_cccv_nd', ...
+    'T_mscc_all','s_mscc_all','C_mscc_all','T_mscc_nd','s_mscc_nd','C_mscc_nd');
+fprintf('결과 저장 완료: %s\n', save_filename);
+
+% =========================================================================
+% ====================== 로컬 함수 (Local Functions) ======================
+% =========================================================================
+function cost = evaluate_cccv(C_rate, model, safety_eps)
+% 목적 함수: 충전시간 T 최소화
+% - 매 평가마다 [C_rate, T, s=min(phis-phil)] 를 cccv_optimization_log.csv에 기록
+% - s <= safety_eps 이면 큰 페널티를 T에 부여해서 탐색에서 배제되도록 함
+    persistent f_count; if isempty(f_count), f_count=0; end; f_count = f_count+1;
+    fprintf('\n[CCCV eval %3d] C_rate=%.3f C\n', f_count, C_rate);
+    try
+        model.param.set('C_rate', num2str(C_rate));
+        model.study('std1').run();
+
+        expressions = {'t','phis-phil','liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
+        data = mpheval(model, expressions, 'dataset','dset1','edim','point','selection',2,'solnum','all');
+
+        t  = data.d1; vdiff = data.d2; cc = data.d3; cv = data.d4;
+        idx = (cc==1) | (cv==1);
+        if ~any(idx)
+            T = 1e6; s = -inf;
+            cost = T;
+            writematrix([C_rate, T, s], 'cccv_optimization_log.csv','WriteMode','append');
+            fprintf('  -> 충전구간 없음: 페널티 T=%.0f\n', T);
+            return;
+        end
+
+        tchg = t(idx); vchg = vdiff(idx);
+        T = tchg(end);
+        s = min(vchg);
+
+        if s <= safety_eps
+            cost = 1e6 + (safety_eps - s)*1e5;  % 안전 위반 강페널티
+            fprintf('  -> 안전위반 s=%.4f V <= %.2f V : 페널티 cost=%.0f\n', s, safety_eps, cost);
+        else
+            cost = T;
+            fprintf('  -> OK: T=%.2f s, s=%.4f V\n', T, s);
+        end
+
+        writematrix([C_rate, T, s], 'cccv_optimization_log.csv','WriteMode','append');
+
+    catch ME
+        warning('CCCV 평가 오류: %s', ME.message);
+        T = 1e6; s = -inf; cost = T;
+        writematrix([C_rate, T, s], 'cccv_optimization_log.csv','WriteMode','append');
+    end
+end
+
+function cost = evaluate_mscc(C, model, safety_eps)
+% 목적 함수: 충전시간 T 최소화
+% - 매 평가마다 [C1..C4, T, s=min(phis-phil)] 를 mscc_optimization_log.csv에 기록
+% - s <= safety_eps 이면 큰 페널티를 T에 부여
+    persistent f_count; if isempty(f_count), f_count=0; end; f_count = f_count+1;
+    fprintf('\n[MSCC eval %3d] C=[%.3f %.3f %.3f %.3f]\n', f_count, C(1),C(2),C(3),C(4));
+    try
+        model.param.set('first_MSCC_Crate',  num2str(C(1)));
+        model.param.set('second_MSCC_Crate', num2str(C(2)));
+        model.param.set('third_MSCC_Crate',  num2str(C(3)));
+        model.param.set('fourth_MSCC_Crate', num2str(C(4)));
+        model.study('std2').run();
+
+        expressions = {'t','phis-phil','liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
+        data = mpheval(model, expressions, 'dataset','dset3','edim','point','selection',2,'solnum','all');
+
+        t  = data.d1; vdiff = data.d2; cc = data.d3; cv = data.d4;
+        idx = (cc==1) | (cv==1);
+        if ~any(idx)
+            T = 1e6; s = -inf;
+            cost = T;
+            writematrix([C, T, s], 'mscc_optimization_log.csv','WriteMode','append');
+            fprintf('  -> 충전구간 없음: 페널티 T=%.0f\n', T);
+            return;
+        end
+
+        tchg = t(idx); vchg = vdiff(idx);
+        T = tchg(end);
+        s = min(vchg);
+
+        if s <= safety_eps
+            cost = 1e6 + (safety_eps - s)*1e5;
+            fprintf('  -> 안전위반 s=%.4f V <= %.2f V : 페널티 cost=%.0f\n', s, safety_eps, cost);
+        else
+            cost = T;
+            fprintf('  -> OK: T=%.2f s, s=%.4f V\n', T, s);
+        end
+
+        writematrix([C, T, s], 'mscc_optimization_log.csv','WriteMode','append');
+
+    catch ME
+        warning('MSCC 평가 오류: %s', ME.message);
+        T = 1e6; s = -inf; cost = T;
+        writematrix([C, T, s], 'mscc_optimization_log.csv','WriteMode','append');
+    end
+end
+
+function mask_nd = isNondominated(F)
+% F: [N x M], 여기서는 M=2, 열1=T(작을수록 좋음), 열2=-s(작을수록 좋음)
+% 반환: 비지배(true)/지배(false)
+    N = size(F,1);
+    mask_nd = true(N,1);
+    for i=1:N
+        if ~mask_nd(i), continue; end
+        for j=1:N
+            if i==j, continue; end
+            % j가 i를 지배? (모든 목적 <= 이고, 적어도 하나는 <)
+            if all(F(j,:) <= F(i,:)) && any(F(j,:) < F(i,:))
+                mask_nd(i) = false; break;
+            end
+        end
+    end
+end
+
+function [i_fast, i_safe, i_knee] = pick3(T, s)
+% Pareto 전선에서 대표 3점(Fastest, Safest, Knee) 인덱스
+    if isempty(T)
+        i_fast=[]; i_safe=[]; i_knee=[]; return;
+    end
+    [~, i_fast] = min(T);
+    [~, i_safe] = max(s);
+    i_knee = findKneeIndex(T, s, i_fast, i_safe);
+end
+
+function idxKnee = findKneeIndex(T, s, i_fast, i_safe)
+% 무릎점: 최속-최안전 직선에서 수직거리 최대점
+    Tn = (T - min(T)) / max(eps, (max(T)-min(T)));
+    sn = (s - min(s)) / max(eps, (max(s)-min(s)));
+    p1 = [Tn(i_fast), sn(i_fast)];
+    p2 = [Tn(i_safe), sn(i_safe)];
+    if norm(p2-p1) < 1e-12, idxKnee = i_fast; return; end
+    v = p2 - p1;
+    dist = zeros(size(Tn));
+    for i=1:numel(Tn)
+        w = [Tn(i), sn(i)] - p1;
+        proj = dot(w,v)/dot(v,v)*v;
+        perp = w - proj;
+        dist(i) = norm(perp);
+    end
+    mask = true(size(dist)); mask([i_fast, i_safe]) = false;
+    [~, idxKnee] = max(dist .* mask);
+    if isempty(idxKnee) || idxKnee==0, idxKnee=i_fast; end
+end
