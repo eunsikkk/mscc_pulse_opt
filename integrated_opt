@@ -35,7 +35,7 @@ safety_eps = 0.02;     % [V]
 N_EVALS    = 100;      % surrogateopt MaxFunctionEvaluations
 
 %% 1) 모델 로드 -------------------------------------------------------------
-filepath = 'C:\Users\user\Downloads';
+filepath = 'G:\공유 드라이브\COMSOL\fast_charging';
 filename = 'ES_MSCC_PC_1015.mph';
 full_path = fullfile(filepath, filename);
 model = mphload(full_path);
