@@ -285,8 +285,12 @@ Z = Z(ok,:); succOK = (TM.s(ok) > eps_s);
 
 labels = [varNames, {'T','s'}];
 f = figure(216); clf; hold on; grid on;
-h = parallelcoords(Z, 'Labels', labels, 'Group', succOK, ...
-    'Quantile',0.0, 'LineWidth', 0.8, 'Color',[.7 .1 .1; .1 .4 .8]); % 실패:붉은, 성공:파란
+h = parallelcoords(Z, 'Labels', labels, 'Group', succOK, 'Quantile',0.5, 'LineWidth',0.8);
+gcolors = [0.70 0.10 0.10; 0.10 0.40 0.80];  % [실패; 성공]
+for i = 1:numel(h)
+    gi = double(succOK(i)) + 1;   % false=1, true=2
+    set(h(i), 'Color', gcolors(gi,:));
+end
 title('MSCC Parallel Coordinates (CSV, succ= s>\epsilon)');
 export_png(f, fullfile(fig_dir,'mscc_parallelcoords_csv.png'));
 
