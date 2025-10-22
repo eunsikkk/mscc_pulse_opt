@@ -1,0 +1,388 @@
+% =========================================================================
+% Post-Plot for CCCV vs MSCC
+%  - 자동으로 최신 run_* 폴더 탐색 후 CSV 로드
+%  - 기존 Figure: 시간–전압/전류, 시간–과전압, SOC–과전압, 누적에너지, (온도)
+%  - 추가 Figure: Pareto, Convergence, Correlation, Feature Importance,
+%                 1D Marginal(PDP-like), 2D Response maps, Feasibility
+%  - 모든 그림은 화면에 표시 + figs/ 에 PNG로 저장
+% =========================================================================
+clc; clear; close all;
+
+%% 0) 경로 설정 & 최신 run_* 폴더 자동선택
+base_dir = 'G:\공유 드라이브\Battery Software Group (2025)\Members\최은식\COMSOL\MSCC_optimization\MSCC_CCCV_opt';
+assert(isfolder(base_dir), '기본 폴더 없음: %s', base_dir);
+
+% 최신 run_* 폴더 찾기
+d = dir(fullfile(base_dir, 'run_*'));
+assert(~isempty(d), 'run_* 폴더를 찾지 못했습니다. 먼저 최적화 스크립트를 실행해 CSV를 생성하세요.');
+[~,ix] = max([d.datenum]);
+run_dir = fullfile(base_dir, d(ix).name);
+ts_dir  = fullfile(run_dir, 'timeseries');
+fig_dir = fullfile(run_dir, 'figs');
+if ~isfolder(fig_dir), mkdir(fig_dir); end
+
+% 로그 파일 경로
+cccv_log = pick_one_file(run_dir, 'cccv_optimization_log_*.csv');
+mscc_log = pick_one_file(run_dir, 'mscc_optimization_log_*.csv');
+
+fprintf('Using run dir: %s\n', run_dir);
+fprintf('  CCCV log: %s\n', cccv_log);
+fprintf('  MSCC  log: %s\n', mscc_log);
+
+% 색상
+blue  = [0, 115, 194]/255;   % CCCV
+red   = [205, 83,  76]/255;  % MSCC
+gray  = 0.75*[1 1 1];
+eps_s = 0.02;                % 안전 임계 (s ≤ eps면 위반)
+
+%% 1) 로그 로드
+TC = readtable(cccv_log);   % [C T s t80 cv_frac E_Wh Vdiff_min Vdiff_max]
+TM = readtable(mscc_log);   % [C1 C2 C3 C4 T s t80 cv_frac E_Wh Vdiff_min Vdiff_max]
+
+% 안전하게 변수명 체크
+reqC = {'C','T','s','t80','cv_frac','E_Wh','Vdiff_min','Vdiff_max'};
+reqM = {'C1','C2','C3','C4','T','s','t80','cv_frac','E_Wh','Vdiff_min','Vdiff_max'};
+assert(all(ismember(reqC, TC.Properties.VariableNames)), 'CCCV 로그 변수명이 예상과 다릅니다.');
+assert(all(ismember(reqM, TM.Properties.VariableNames)), 'MSCC  로그 변수명이 예상과 다릅니다.');
+
+C_cccv = TC.C;     T_cccv = TC.T;     s_cccv = TC.s;
+X_mscc = TM{:, {'C1','C2','C3','C4'}}; T_mscc = TM.T; s_mscc = TM.s;
+varNames = {'C1','C2','C3','C4'};
+
+%% 2) Pareto front (T vs s) ------------------------------------------------
+% 비지배해 판정: 최소화 F=[T, -s]
+mask_nd_C = isNondominated([T_cccv, -s_cccv]);
+mask_nd_M = isNondominated([T_mscc, -s_mscc]);
+
+[Tc_nd, ordC] = sort(T_cccv(mask_nd_C), 'ascend');
+sc_nd = s_cccv(mask_nd_C); sc_nd = sc_nd(ordC);
+
+[Tm_nd, ordM] = sort(T_mscc(mask_nd_M), 'ascend');
+sm_nd = s_mscc(mask_nd_M); sm_nd = sm_nd(ordM);
+
+f = figure(201); clf; hold on; grid on;
+scatter(T_cccv, s_cccv, 26, blue, 'filled', 'MarkerFaceAlpha',0.25, 'DisplayName','CCCV 샘플');
+scatter(T_mscc, s_mscc, 26, red , 'filled', 'MarkerFaceAlpha',0.25, 'DisplayName','MSCC 샘플');
+plot(Tc_nd, sc_nd, '-o', 'Color', blue,'LineWidth',1.8, 'DisplayName','CCCV Pareto');
+plot(Tm_nd, sm_nd, '-o', 'Color', red , 'LineWidth',1.8, 'DisplayName','MSCC Pareto');
+xlabel('충전시간 T (s)'); ylabel('안전여유 s = min(\phi_s-\phi_l) (V)');
+title('CCCV vs MSCC: Pareto front');
+legend('Location','best'); set(gca,'FontSize',11);
+export_png(f, fullfile(fig_dir,'pareto_T_vs_s.png'));
+
+%% 3) Convergence (best-so-far T) -----------------------------------------
+f = figure(202); clf; tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+nexttile;
+plot(cummin(T_cccv), '-','LineWidth',1.5,'Color',blue); grid on;
+xlabel('평가 #'); ylabel('best-so-far T (s)'); title('CCCV 수렴(로그 순서)');
+
+nexttile;
+plot(cummin(T_mscc), '-','LineWidth',1.5,'Color',red); grid on;
+xlabel('평가 #'); ylabel('best-so-far T (s)'); title('MSCC 수렴(로그 순서)');
+export_png(f, fullfile(fig_dir,'convergence_best_T.png'));
+
+%% 4) Correlation heatmaps (MSCC만) ----------------------------------------
+labels = [varNames, {'T','s'}];
+R_p = corr([X_mscc T_mscc s_mscc], 'Type','Pearson','Rows','pairwise');
+R_s = corr([X_mscc T_mscc s_mscc], 'Type','Spearman','Rows','pairwise');
+
+f = figure(203); clf; tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+nexttile; imagesc(R_p); axis image; colorbar; caxis([-1 1]);
+set(gca,'XTick',1:numel(labels),'XTickLabel',labels,'XTickLabelRotation',45,...
+        'YTick',1:numel(labels),'YTickLabel',labels);
+title('MSCC 상관(Pearson)'); 
+nexttile; imagesc(R_s); axis image; colorbar; caxis([-1 1]);
+set(gca,'XTick',1:numel(labels),'XTickLabel',labels,'XTickLabelRotation',45,...
+        'YTick',1:numel(labels),'YTickLabel',labels);
+title('MSCC 상관(Spearman)');
+export_png(f, fullfile(fig_dir,'mscc_correlation_heatmaps.png'));
+
+%% 5) Feature importance (RandomForest, T & s) -----------------------------
+hasML = (exist('TreeBagger','file') == 2);
+if hasML
+    rng(42);
+    try
+        M_T = TreeBagger(200, X_mscc, T_mscc, 'Method','regression', ...
+            'OOBPrediction','on','OOBPredictorImportance','on');
+        impT = M_T.OOBPermutedPredictorDeltaError(:);
+
+        M_s = TreeBagger(200, X_mscc, s_mscc, 'Method','regression', ...
+            'OOBPrediction','on','OOBPredictorImportance','on');
+        impS = M_s.OOBPermutedPredictorDeltaError(:);
+
+        f = figure(204); clf; tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+        nexttile; bar(impT,'FaceColor',red); grid on;
+        set(gca,'XTick',1:4,'XTickLabel',varNames); ylabel('\DeltaOOB Error'); title('중요도→T');
+        nexttile; bar(impS,'FaceColor',red); grid on;
+        set(gca,'XTick',1:4,'XTickLabel',varNames); ylabel('\DeltaOOB Error'); title('중요도→s');
+        export_png(f, fullfile(fig_dir,'mscc_feature_importance.png'));
+    catch ME
+        warning('TreeBagger 실행 실패: %s. 간이 대체(표준화 회귀) 진행.', ME.message);
+        plot_lr_importance(X_mscc,T_mscc,s_mscc,varNames,fig_dir);
+    end
+else
+    warning('TreeBagger 미탑재: 간이 대체(표준화 회귀) 진행.');
+    plot_lr_importance(X_mscc,T_mscc,s_mscc,varNames,fig_dir);
+end
+
+%% 6) 1D marginal (binned median) ------------------------------------------
+nbins = 12;
+f = figure(205); clf; tiledlayout(2,4,'Padding','compact','TileSpacing','compact');
+for i=1:4
+    xi = X_mscc(:,i);
+    [centers, medT] = binned_median(xi, T_mscc, nbins);
+    [~, medS]      = binned_median(xi, s_mscc, nbins);
+
+    nexttile(i);
+    plot(centers, medT, '-o','Color',red,'LineWidth',1.5,'MarkerSize',4); grid on;
+    xlabel(varNames{i}); ylabel('median T (s)'); title(sprintf('Ci→T (%s)',varNames{i}));
+
+    nexttile(i+4);
+    plot(centers, medS, '-o','Color',red,'LineWidth',1.5,'MarkerSize',4); grid on;
+    yline(eps_s,'--k','\epsilon','HandleVisibility','off');
+    xlabel(varNames{i}); ylabel('median s (V)'); title(sprintf('Ci→s (%s)',varNames{i}));
+end
+export_png(f, fullfile(fig_dir,'mscc_1D_marginals.png'));
+
+%% 7) 2D response maps (Ci,Cj) → median T/s --------------------------------
+pairs = nchoosek(1:4,2);
+nbx = 12; nby = 12;
+f = figure(206); clf; tiledlayout(size(pairs,1),2,'Padding','compact','TileSpacing','compact');
+for k=1:size(pairs,1)
+    i = pairs(k,1); j = pairs(k,2);
+    xi = X_mscc(:,i); xj = X_mscc(:,j);
+    [Xc, Yc, ZT] = binned_2d_median(xi, xj, T_mscc, nbx, nby);
+    [~,  ~,  ZS] = binned_2d_median(xi, xj, s_mscc, nbx, nby);
+
+    nexttile; imagesc(Xc, Yc, ZT); axis xy; colorbar;
+    xlabel(varNames{j}); ylabel(varNames{i});
+    title(sprintf('median T: (%s,%s)', varNames{i}, varNames{j}));
+
+    nexttile; imagesc(Xc, Yc, ZS); axis xy; colorbar;
+    xlabel(varNames{j}); ylabel(varNames{i});
+    title(sprintf('median s: (%s,%s)', varNames{i}, varNames{j}));
+end
+export_png(f, fullfile(fig_dir,'mscc_2D_response_maps.png'));
+
+%% 8) Feasibility vs Ci (s ≤ eps 비율) -------------------------------------
+f = figure(207); clf; tiledlayout(1,4,'Padding','compact','TileSpacing','compact');
+for i=1:4
+    xi = X_mscc(:,i);
+    [centers, rate] = binned_rate(xi, s_mscc <= eps_s, nbins);
+    nexttile;
+    plot(centers, rate, '-o','Color',red,'LineWidth',1.5,'MarkerSize',4); grid on;
+    ylim([0 1]); xlabel(varNames{i}); ylabel('위반비율 (s \le \epsilon)');
+    title(sprintf('Feasibility (%s)', varNames{i}));
+end
+export_png(f, fullfile(fig_dir,'mscc_feasibility.png'));
+
+%% 8.5) Search-space 3D scatter (CSV 기반, 조합별 시각화) -------------------
+% 성공/실패 정의: s > eps_s ⇒ 성공, s ≤ eps_s ⇒ 실패
+succ = TM.s > eps_s & isfinite(TM.T);
+fail = TM.s <= eps_s | ~isfinite(TM.T);
+
+combos = {
+    {'C1','C2','C3'}, 208;
+    {'C1','C2','C4'}, 209;
+    {'C1','C3','C4'}, 210;
+    {'C2','C3','C4'}, 211;
+};
+
+for k = 1:size(combos,1)
+    cols = combos{k,1}; fnum = combos{k,2};
+    Xi = TM.(cols{1}); Xj = TM.(cols{2}); Xk = TM.(cols{3});
+
+    f = figure(fnum); clf; hold on; grid on; view(3);
+    if any(fail)
+        scatter3(Xi(fail), Xj(fail), Xk(fail), 30, [0.7 0 0], 'x', 'DisplayName','실패(s\le\epsilon)');
+    end
+    if any(succ)
+        scatter3(Xi(succ), Xj(succ), Xk(succ), 40, [0 0.45 0.74], 'o', 'filled', 'DisplayName','성공(s>\epsilon)');
+    end
+
+    % (선택) Pareto 근접 점 강조: 상위 10% 빠른 시간 & s>eps
+    qT = quantile(TM.T(succ), 0.10);
+    nearPareto = succ & TM.T <= qT;
+    if any(nearPareto)
+        scatter3(Xi(nearPareto), Xj(nearPareto), Xk(nearPareto), 70, 'k', '*', 'DisplayName','빠른 상위10%');
+    end
+
+    xlabel(cols{1}); ylabel(cols{2}); zlabel(cols{3});
+    title(sprintf('탐색공간: (%s, %s, %s)', cols{1}, cols{2}, cols{3}));
+    legend('Location','best');
+    export_png(f, fullfile(fig_dir, sprintf('space3d_%s_%s_%s.png', cols{1}, cols{2}, cols{3})));
+end
+
+
+%% 9) 기존 Figure (대표 시계열 CSV 기반) -----------------------------------
+% timeseries 디렉토리에 다음 파일들을 자동 검색 후 그려줌:
+%   CCCV_fast/safe/knee.csv, MSCC_fast/safe/knee.csv
+series = dir(fullfile(ts_dir, '*.csv'));
+if isempty(series)
+    warning('대표 시계열 CSV를 찾지 못했습니다: %s', ts_dir);
+else
+    % 그룹별로 읽기
+    S = struct('name',{},'tbl',{},'color',{});
+    for k=1:numel(series)
+        fp = fullfile(series(k).folder, series(k).name);
+        TBL = readtable(fp);
+        S(end+1).name = series(k).name; %#ok<SAGROW>
+        S(end).tbl    = TBL;
+        if startsWith(lower(series(k).name),'cccv')
+            S(end).color = blue;
+        else
+            S(end).color = red;
+        end
+    end
+
+    % (a) 시간–전압/전류 (yyaxis)
+    f = figure(301); clf; hold on; grid on;
+    for k=1:numel(S)
+        t=S(k).tbl.t; V=S(k).tbl.E_cell; I=S(k).tbl.I_cell;
+        yyaxis left;  plot(t,V,'-','LineWidth',1.3,'Color',S(k).color);
+        yyaxis right; plot(t,I,'--','LineWidth',1.1,'Color',S(k).color);
+    end
+    yyaxis left;  ylabel('V (V)');
+    yyaxis right; ylabel('I (A)');
+    xlabel('t (s)'); title('시간–전압/전류 (대표 시계열)');
+    export_png(f, fullfile(fig_dir,'timeseries_VI.png'));
+
+    % (b) SOC–과전압
+    f = figure(302); clf; hold on; grid on;
+    for k=1:numel(S)
+        plot(S(k).tbl.SOC, S(k).tbl.phis_minus_phil, 'LineWidth',1.3,'Color',S(k).color);
+    end
+    xlabel('SOC'); ylabel('\phi_s-\phi_l (V)'); title('SOC–과전압 (대표 시계열)');
+    export_png(f, fullfile(fig_dir,'timeseries_SOC_overpot.png'));
+
+    % (c) 시간–과전압
+    f = figure(303); clf; hold on; grid on;
+    for k=1:numel(S)
+        plot(S(k).tbl.t, S(k).tbl.phis_minus_phil, 'LineWidth',1.3,'Color',S(k).color);
+    end
+    xlabel('t (s)'); ylabel('\phi_s-\phi_l (V)'); title('시간–과전압 (대표 시계열)');
+    export_png(f, fullfile(fig_dir,'timeseries_t_overpot.png'));
+
+    % (d) 누적 에너지
+    f = figure(304); clf; hold on; grid on;
+    for k=1:numel(S)
+        t=S(k).tbl.t; V=S(k).tbl.E_cell; I=S(k).tbl.I_cell;
+        E = cumtrapz(t, V.*I)/3600; % Wh
+        plot(t, E, 'LineWidth',1.3,'Color',S(k).color);
+    end
+    xlabel('t (s)'); ylabel('누적 에너지 (Wh)'); title('누적 에너지 (대표 시계열)');
+    export_png(f, fullfile(fig_dir,'timeseries_cum_energy.png'));
+
+    % (e) 온도 (있으면)
+    hasT = any( ismember({'T_avg','T_max'}, S(1).tbl.Properties.VariableNames) );
+    if hasT
+        % 평균온도
+        f = figure(305); clf; hold on; grid on;
+        for k=1:numel(S)
+            if ismember('T_avg', S(k).tbl.Properties.VariableNames)
+                plot(S(k).tbl.t, S(k).tbl.T_avg, 'LineWidth',1.3,'Color',S(k).color);
+            end
+        end
+        xlabel('t (s)'); ylabel('T_{avg} (K)'); title('평균 온도 (대표 시계열)'); 
+        export_png(f, fullfile(fig_dir,'timeseries_Tavg.png'));
+
+        % 최고온도
+        f = figure(306); clf; hold on; grid on;
+        for k=1:numel(S)
+            if ismember('T_max', S(k).tbl.Properties.VariableNames)
+                plot(S(k).tbl.t, S(k).tbl.T_max, 'LineWidth',1.3,'Color',S(k).color);
+            end
+        end
+        xlabel('t (s)'); ylabel('T_{max} (K)'); title('최고 온도 (대표 시계열)'); 
+        export_png(f, fullfile(fig_dir,'timeseries_Tmax.png'));
+    end
+end
+
+disp('완료: figs/ 폴더에 모든 PNG가 저장되었습니다.');
+
+%% ======================= Local helper functions ==========================
+function fpath = pick_one_file(folder, pattern)
+    L = dir(fullfile(folder, pattern));
+    assert(~isempty(L), '파일이 없습니다: %s', fullfile(folder, pattern));
+    % 가장 최근 파일 선택
+    [~,ix] = max([L.datenum]);
+    fpath = fullfile(L(ix).folder, L(ix).name);
+end
+
+function export_png(fig_handle, outpath)
+    try
+        set(fig_handle, 'Color','w');
+        exportgraphics(fig_handle, outpath, 'Resolution', 200);
+    catch
+        warning('PNG 저장 실패: %s', outpath);
+    end
+end
+
+function mask_nd = isNondominated(F)
+% F: [N x M], M=2 (열1=T(작을수록), 열2=-s(작을수록))
+% 반환: 비지배(true)/지배(false)
+    N = size(F,1);
+    mask_nd = true(N,1);
+    for i=1:N
+        if ~mask_nd(i), continue; end
+        for j=1:N
+            if i==j, continue; end
+            if all(F(j,:) <= F(i,:)) && any(F(j,:) < F(i,:))
+                mask_nd(i) = false; break;
+            end
+        end
+    end
+end
+
+function [centers, medY] = binned_median(x, y, nbins)
+    edges   = linspace(min(x), max(x), nbins+1);
+    centers = movmean(edges,2,'Endpoints','discard');
+    [~,bin] = histc(x, edges);
+    medY    = nan(nbins,1);
+    for b=1:nbins
+        idx = (bin==b);
+        if any(idx), medY(b) = median(y(idx)); end
+    end
+end
+
+function [centersX, centersY, Z] = binned_2d_median(x, y, z, nx, ny)
+    ex = linspace(min(x), max(x), nx+1);
+    ey = linspace(min(y), max(y), ny+1);
+    centersX = movmean(ex,2,'Endpoints','discard');
+    centersY = movmean(ey,2,'Endpoints','discard');
+    Z = nan(nx, ny);
+    for i=1:nx
+        for j=1:ny
+            idx = x>=ex(i) & x<ex(i+1) & y>=ey(j) & y<ey(j+1);
+            if any(idx), Z(i,j) = median(z(idx)); end
+        end
+    end
+end
+
+function [centers, rate] = binned_rate(x, flag, nbins)
+    edges   = linspace(min(x), max(x), nbins+1);
+    centers = movmean(edges,2,'Endpoints','discard');
+    [~,bin] = histc(x, edges);
+    rate    = nan(nbins,1);
+    for b=1:nbins
+        idx = (bin==b);
+        if any(idx), rate(b) = mean(flag(idx)); end
+    end
+end
+
+function plot_lr_importance(X, T_mscc, s_mscc, varNames, fig_dir)
+% TreeBagger가 없을 때 대체: 표준화 후 선형회귀 계수 절댓값으로 중요도 근사
+    Xz = (X - mean(X,1)) ./ std(X,0,1);
+    Xz(:, any(~isfinite(Xz))) = 0;
+
+    bT = Xz \ T_mscc;
+    bs = Xz \ s_mscc;
+    impT = abs(bT(:)); impS = abs(bs(:));
+
+    f = figure(204); clf; tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+    nexttile; bar(impT,'FaceColor',[.6 .2 .2]); grid on;
+    set(gca,'XTick',1:4,'XTickLabel',varNames); ylabel('|coef|'); title('대체 중요도→T');
+    nexttile; bar(impS,'FaceColor',[.6 .2 .2]); grid on;
+    set(gca,'XTick',1:4,'XTickLabel',varNames); ylabel('|coef|'); title('대체 중요도→s');
+    export_png(f, fullfile(fig_dir,'mscc_feature_importance_linear.png'));
+end
