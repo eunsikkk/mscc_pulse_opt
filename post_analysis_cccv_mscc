@@ -1,0 +1,186 @@
+% =========================================================================
+% Post Analysis for CCCV vs MSCC Optimization
+%  - Logs only: cccv_optimization_log.csv [C, T, s]
+%               mscc_optimization_log.csv [C1 C2 C3 C4 T s]
+%  - Outputs:
+%     1) Convergence curves (가짜 수렴: 로그 순서 기반)
+%     2) Correlation heatmaps (Pearson/Spearman)
+%     3) Feature importance via RandomForest (TreeBagger)
+%     4) 1D marginal (PDP-like) curves for each Ci → T, s
+%     5) 2D response maps (median T, median s) for (Ci,Cj)
+%     6) Feasibility vs Ci (s <= eps 비율)
+% =========================================================================
+clc; clear; close all;
+
+% ---- 스타일/색상
+blue  = [0, 115, 194]/255;   % CCCV
+red   = [205, 83,  76]/255;  % MSCC
+gray  = 0.75*[1 1 1];
+eps_s = 0.01;                % 안전 임계
+
+% ---- 로그 로드
+assert(isfile('cccv_optimization_log.csv'), 'cccv_optimization_log.csv 없음');
+assert(isfile('mscc_optimization_log.csv'), 'mscc_optimization_log.csv 없음');
+
+L_C  = readmatrix('cccv_optimization_log.csv');  % [C, T, s]
+L_M  = readmatrix('mscc_optimization_log.csv'); % [C1 C2 C3 C4 T s]
+
+% ---- 파싱
+C_cccv = L_C(:,1); T_cccv = L_C(:,2); s_cccv = L_C(:,3);
+X_mscc = L_M(:,1:4);       T_mscc = L_M(:,5);    s_mscc = L_M(:,6);
+varNames = {'C1','C2','C3','C4'};
+
+%% 0) 데이터 요약 출력
+fprintf('CCCV trials: %d, MSCC trials: %d\n', numel(T_cccv), numel(T_mscc));
+fprintf('MSCC T (median/min/max): %.1f / %.1f / %.1f s\n', median(T_mscc), min(T_mscc), max(T_mscc));
+fprintf('MSCC s (median/min/max): %.4f / %.4f / %.4f V\n', median(s_mscc), min(s_mscc), max(s_mscc));
+
+%% 1) Convergence (best-so-far by log order)
+figure(101); clf; tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+
+nexttile; 
+bestC = cummin(T_cccv); 
+plot(bestC,'-','LineWidth',1.5,'Color',blue); grid on;
+xlabel('평가 #'); ylabel('best-so-far T (s)'); title('CCCV 수렴(로그 순서)');
+
+nexttile; 
+bestM = cummin(T_mscc);
+plot(bestM,'-','LineWidth',1.5,'Color',red); grid on;
+xlabel('평가 #'); ylabel('best-so-far T (s)'); title('MSCC 수렴(로그 순서)');
+
+%% 2) Correlation heatmaps (Pearson & Spearman)
+% --- MSCC 전용: C1..C4 vs [T, s]
+figure(102); clf; tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+
+% Pearson
+R_p = corr([X_mscc T_mscc s_mscc],'Type','Pearson','Rows','pairwise');
+labels = [varNames, {'T','s'}];
+nexttile;
+imagesc(R_p); axis image; colorbar; caxis([-1 1]);
+set(gca,'XTick',1:numel(labels),'XTickLabel',labels,'XTickLabelRotation',45,...
+        'YTick',1:numel(labels),'YTickLabel',labels);
+title('MSCC 상관(Pearson)');
+
+% Spearman
+R_s = corr([X_mscc T_mscc s_mscc],'Type','Spearman','Rows','pairwise');
+nexttile;
+imagesc(R_s); axis image; colorbar; caxis([-1 1]);
+set(gca,'XTick',1:numel(labels),'XTickLabel',labels,'XTickLabelRotation',45,...
+        'YTick',1:numel(labels),'YTickLabel',labels);
+title('MSCC 상관(Spearman)');
+
+%% 3) Feature Importance (Random Forest, OOB Permuted Importance)
+%  - 각 C_i가 T와 s에 미치는 상대중요도
+try
+    rng(42);
+    M_T = TreeBagger(200, X_mscc, T_mscc, 'Method','regression', ...
+                     'OOBPrediction','on','OOBPredictorImportance','on');
+    impT = M_T.OOBPermutedPredictorDeltaError(:);
+
+    M_s = TreeBagger(200, X_mscc, s_mscc, 'Method','regression', ...
+                     'OOBPrediction','on','OOBPredictorImportance','on');
+    impS = M_s.OOBPermutedPredictorDeltaError(:);
+
+    figure(103); clf; tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+
+    nexttile;
+    bar(impT,'FaceColor',red); grid on;
+    set(gca,'XTick',1:4,'XTickLabel',varNames);
+    ylabel('Importance (ΔOOB Error)');
+    title('MSCC 특징중요도 → T');
+
+    nexttile;
+    bar(impS,'FaceColor',red); grid on;
+    set(gca,'XTick',1:4,'XTickLabel',varNames);
+    ylabel('Importance (ΔOOB Error)');
+    title('MSCC 특징중요도 → s');
+catch ME
+    warning('TreeBagger 사용 불가(Statistics and ML Toolbox 필요): %s', ME.message);
+end
+
+%% 4) 1D marginal (binned median) curves: Ci → T, s
+%  - 각 C_i를 12구간으로 분할, 구간 내 median(T), median(s) 계산
+nbins = 12;
+figure(104); clf; tiledlayout(2,4,'Padding','compact','TileSpacing','compact');
+for i=1:4
+    edges = linspace(min(X_mscc(:,i)), max(X_mscc(:,i)), nbins+1);
+    [~,bin] = histc(X_mscc(:,i), edges);
+    medT = nan(nbins,1); medS = nan(nbins,1); centers = movmean(edges,2,'Endpoints','discard');
+    for b=1:nbins
+        idx = (bin==b);
+        if any(idx)
+            medT(b) = median(T_mscc(idx));
+            medS(b) = median(s_mscc(idx));
+        end
+    end
+
+    nexttile(i);            % 1행: T
+    plot(centers, medT,'-o','Color',red,'LineWidth',1.5,'MarkerSize',4); grid on;
+    xlabel(varNames{i}); ylabel('median T (s)'); title(sprintf('Ci→T (%s)',varNames{i}));
+
+    nexttile(i+4);          % 2행: s
+    plot(centers, medS,'-o','Color',red,'LineWidth',1.5,'MarkerSize',4); grid on;
+    xlabel(varNames{i}); ylabel('median s (V)'); title(sprintf('Ci→s (%s)',varNames{i}));
+    yline(eps_s,'--k','\epsilon','HandleVisibility','off');
+end
+
+%% 5) 2D response maps: (Ci,Cj) → median T / median s
+pairs = nchoosek(1:4,2);
+nbx = 10; nby = 10;
+figure(105); clf; tiledlayout(size(pairs,1),2,'Padding','compact','TileSpacing','compact');
+
+for k=1:size(pairs,1)
+    i = pairs(k,1); j = pairs(k,2);
+    xi = X_mscc(:,i); xj = X_mscc(:,j);
+
+    ei = linspace(min(xi), max(xi), nbx+1);
+    ej = linspace(min(xj), max(xj), nby+1);
+    Ti = nan(nbx,nby); Si = nan(nbx,nby);
+
+    for a=1:nbx
+        for b=1:nby
+            idx = xi>=ei(a) & xi<ei(a+1) & xj>=ej(b) & xj<ej(b+1);
+            if any(idx)
+                Ti(a,b) = median(T_mscc(idx));
+                Si(a,b) = median(s_mscc(idx));
+            end
+        end
+    end
+
+    nexttile; imagesc(movmean(ej,2,'Endpoints','discard'), movmean(ei,2,'Endpoints','discard'), Ti);
+    axis xy; colorbar; xlabel(varNames{j}); ylabel(varNames{i});
+    title(sprintf('median T: (%s,%s)',varNames{i},varNames{j}));
+
+    nexttile; imagesc(movmean(ej,2,'Endpoints','discard'), movmean(ei,2,'Endpoints','discard'), Si);
+    axis xy; colorbar; xlabel(varNames{j}); ylabel(varNames{i});
+    title(sprintf('median s: (%s,%s)',varNames{i},varNames{j}));
+end
+
+%% 6) Feasibility vs Ci (s <= eps 비율)
+figure(106); clf; tiledlayout(1,4,'Padding','compact','TileSpacing','compact');
+for i=1:4
+    edges = linspace(min(X_mscc(:,i)), max(X_mscc(:,i)), nbins+1);
+    [~,bin] = histc(X_mscc(:,i), edges);
+    rate = nan(nbins,1); centers = movmean(edges,2,'Endpoints','discard');
+    for b=1:nbins
+        idx = (bin==b);
+        if any(idx)
+            rate(b) = mean(s_mscc(idx) <= eps_s);   % 위반 비율
+        end
+    end
+    nexttile;
+    plot(centers, rate,'-o','Color',red,'LineWidth',1.5,'MarkerSize',4); grid on;
+    ylim([0 1]); xlabel(varNames{i}); ylabel('위반 비율 (s \leq \epsilon)');
+    title(sprintf('Feasibility map (%s)',varNames{i}));
+end
+
+%% (보너스) CCCV 개요: C vs T, s
+figure(107); clf; tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+nexttile; scatter(C_cccv, T_cccv, 36, blue, 'filled'); grid on;
+xlabel('C'); ylabel('T (s)'); title('CCCV: C vs T');
+
+nexttile; scatter(C_cccv, s_cccv, 36, blue, 'filled'); grid on;
+yline(eps_s,'--k','\epsilon','HandleVisibility','off');
+xlabel('C'); ylabel('s (V)'); title('CCCV: C vs s');
+
+disp('완료: 101~107 Figure 확인');
