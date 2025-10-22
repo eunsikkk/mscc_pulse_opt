@@ -12,7 +12,7 @@ if exist('cccv_optimization_log.csv','file'); delete('cccv_optimization_log.csv'
 if exist('mscc_optimization_log.csv','file'); delete('mscc_optimization_log.csv'); end
 
 % 모델 불러오기
-filepath = 'C:\Users\dsdsd\Downloads';
+filepath = 'C:\Users\user\Downloads';
 filename = 'ES_MSCC_PC_1015.mph';     % 사용자 모델 파일명
 full_path = fullfile(filepath, filename);
 model = mphload(full_path);
@@ -25,10 +25,10 @@ red_color   = [205, 83, 76]/255;  % MSCC
 gray_color  = 0.75*[1 1 1];
 
 % 안전여유 경계 (네 코드와 동일하게 0.02 V 사용)
-safety_eps = 0.02;   % [V]
+safety_eps = 0.01;   % [V]
 
 % 최적화 평가 횟수
-N_EVALS = 10;   % surrogateopt MaxFunctionEvaluations
+N_EVALS = 200;   % surrogateopt MaxFunctionEvaluations
 
 % =========================================================================
 % PART 1: CCCV 최적화 (단일 변수: C_rate)
@@ -225,10 +225,20 @@ fprintf('결과 저장 완료: %s\n', save_filename);
 % ====================== 로컬 함수 (Local Functions) ======================
 % =========================================================================
 function cost = evaluate_cccv(C_rate, model, safety_eps)
-% 목적 함수: 충전시간 T 최소화
-% - 매 평가마다 [C_rate, T, s=min(phis-phil)] 를 cccv_optimization_log.csv에 기록
-% - s <= safety_eps 이면 큰 페널티를 T에 부여해서 탐색에서 배제되도록 함
-    persistent f_count; if isempty(f_count), f_count=0; end; f_count = f_count+1;
+% 목적: 충전시간 T 최소화
+% 로그 컬럼: [C_rate, T, s=min(phis-phil)]
+    persistent f_count log_path
+    if isempty(f_count)
+        f_count = 0;
+        % 고정 저장 경로
+        base_dir = 'G:\공유 드라이브\Battery Software Group (2025)\Members\최은식\COMSOL\MSCC_optimization\MSCC_CCCV_opt';
+        if ~exist(base_dir, 'dir'); mkdir(base_dir); end
+        % 날짜+시간 포함 파일명
+        timestamp = datestr(now, 'yyyymmdd_HHMMSS');
+        log_path = fullfile(base_dir, ['cccv_optimization_log_' timestamp '.csv']);
+    end
+    f_count = f_count + 1;
+
     fprintf('\n[CCCV eval %3d] C_rate=%.3f C\n', f_count, C_rate);
     try
         model.param.set('C_rate', num2str(C_rate));
@@ -240,9 +250,9 @@ function cost = evaluate_cccv(C_rate, model, safety_eps)
         t  = data.d1; vdiff = data.d2; cc = data.d3; cv = data.d4;
         idx = (cc==1) | (cv==1);
         if ~any(idx)
-            T = 1e6; s = -inf;
+            T = 1e6; s = -inf;               % 패널티
             cost = T;
-            writematrix([C_rate, T, s], 'cccv_optimization_log.csv','WriteMode','append');
+            writematrix([C_rate, T, s], log_path, 'WriteMode','append');
             fprintf('  -> 충전구간 없음: 페널티 T=%.0f\n', T);
             return;
         end
@@ -252,27 +262,38 @@ function cost = evaluate_cccv(C_rate, model, safety_eps)
         s = min(vchg);
 
         if s <= safety_eps
-            cost = 1e6 + (safety_eps - s)*1e5;  % 안전 위반 강페널티
-            fprintf('  -> 안전위반 s=%.4f V <= %.2f V : 페널티 cost=%.0f\n', s, safety_eps, cost);
+            cost = 1e6 + (safety_eps - s)*1e5;   % 안전 위반 강페널티
+            fprintf('  -> 안전위반 s=%.4f V <= %.2f V : cost=%.0f\n', s, safety_eps, cost);
         else
             cost = T;
             fprintf('  -> OK: T=%.2f s, s=%.4f V\n', T, s);
         end
 
-        writematrix([C_rate, T, s], 'cccv_optimization_log.csv','WriteMode','append');
+        writematrix([C_rate, T, s], log_path, 'WriteMode','append');
 
     catch ME
         warning('CCCV 평가 오류: %s', ME.message);
         T = 1e6; s = -inf; cost = T;
-        writematrix([C_rate, T, s], 'cccv_optimization_log.csv','WriteMode','append');
+        writematrix([C_rate, T, s], log_path, 'WriteMode','append');
     end
 end
 
+
 function cost = evaluate_mscc(C, model, safety_eps)
-% 목적 함수: 충전시간 T 최소화
-% - 매 평가마다 [C1..C4, T, s=min(phis-phil)] 를 mscc_optimization_log.csv에 기록
-% - s <= safety_eps 이면 큰 페널티를 T에 부여
-    persistent f_count; if isempty(f_count), f_count=0; end; f_count = f_count+1;
+% 목적: 충전시간 T 최소화
+% 로그 컬럼: [C1 C2 C3 C4 T s=min(phis-phil)]
+    persistent f_count log_path
+    if isempty(f_count)
+        f_count = 0;
+        % 고정 저장 경로
+        base_dir = 'G:\공유 드라이브\Battery Software Group (2025)\Members\최은식\COMSOL\MSCC_optimization\MSCC_CCCV_opt';
+        if ~exist(base_dir, 'dir'); mkdir(base_dir); end
+        % 날짜+시간 포함 파일명
+        timestamp = datestr(now, 'yyyymmdd_HHMMSS');
+        log_path = fullfile(base_dir, ['mscc_optimization_log_' timestamp '.csv']);
+    end
+    f_count = f_count + 1;
+
     fprintf('\n[MSCC eval %3d] C=[%.3f %.3f %.3f %.3f]\n', f_count, C(1),C(2),C(3),C(4));
     try
         model.param.set('first_MSCC_Crate',  num2str(C(1)));
@@ -287,9 +308,9 @@ function cost = evaluate_mscc(C, model, safety_eps)
         t  = data.d1; vdiff = data.d2; cc = data.d3; cv = data.d4;
         idx = (cc==1) | (cv==1);
         if ~any(idx)
-            T = 1e6; s = -inf;
+            T = 1e6; s = -inf;               % 패널티
             cost = T;
-            writematrix([C, T, s], 'mscc_optimization_log.csv','WriteMode','append');
+            writematrix([C, T, s], log_path, 'WriteMode','append');
             fprintf('  -> 충전구간 없음: 페널티 T=%.0f\n', T);
             return;
         end
@@ -300,18 +321,18 @@ function cost = evaluate_mscc(C, model, safety_eps)
 
         if s <= safety_eps
             cost = 1e6 + (safety_eps - s)*1e5;
-            fprintf('  -> 안전위반 s=%.4f V <= %.2f V : 페널티 cost=%.0f\n', s, safety_eps, cost);
+            fprintf('  -> 안전위반 s=%.4f V <= %.2f V : cost=%.0f\n', s, safety_eps, cost);
         else
             cost = T;
             fprintf('  -> OK: T=%.2f s, s=%.4f V\n', T, s);
         end
 
-        writematrix([C, T, s], 'mscc_optimization_log.csv','WriteMode','append');
+        writematrix([C, T, s], log_path, 'WriteMode','append');
 
     catch ME
         warning('MSCC 평가 오류: %s', ME.message);
         T = 1e6; s = -inf; cost = T;
-        writematrix([C, T, s], 'mscc_optimization_log.csv','WriteMode','append');
+        writematrix([C, T, s], log_path, 'WriteMode','append');
     end
 end
 
@@ -361,3 +382,13 @@ function idxKnee = findKneeIndex(T, s, i_fast, i_safe)
     [~, idxKnee] = max(dist .* mask);
     if isempty(idxKnee) || idxKnee==0, idxKnee=i_fast; end
 end
+
+% function latest_path = latest_log(base_dir, prefix)
+% % prefix 예: 'cccv_optimization_log_' 또는 'mscc_optimization_log_'
+%     d = dir(fullfile(base_dir, [prefix '*.csv']));
+%     if isempty(d)
+%         error('No log files found with prefix %s in %s', prefix, base_dir);
+%     end
+%     [~,i] = max([d.datenum]);
+%     latest_path = fullfile(d(i).folder, d(i).name);
+% end
