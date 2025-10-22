@@ -213,6 +213,83 @@ for k = 1:size(combos,1)
     export_png(f, fullfile(fig_dir, sprintf('space3d_%s_%s_%s.png', cols{1}, cols{2}, cols{3})));
 end
 
+%% 8.6) CV fraction diagnostics (csv: cv_frac) ------------------------------
+% 산점도: cv_frac vs T, cv_frac vs s  + 분포
+f = figure(212); clf; tiledlayout(1,3,'Padding','compact','TileSpacing','compact');
+
+% (a) cv_frac vs T
+nexttile; hold on; grid on;
+scatter(TM.cv_frac, TM.T, 18, red, 'filled', 'MarkerFaceAlpha',0.35);
+xlabel('cv\_frac'); ylabel('T (s)'); title('MSCC: cv\_frac vs T');
+
+% (b) cv_frac vs s
+nexttile; hold on; grid on;
+scatter(TM.cv_frac, TM.s, 18, red, 'filled', 'MarkerFaceAlpha',0.35);
+yline(eps_s,'--k','\epsilon','HandleVisibility','off');
+xlabel('cv\_frac'); ylabel('s (V)'); title('MSCC: cv\_frac vs s');
+
+% (c) 분포
+nexttile; hold on; grid on;
+histogram(TM.cv_frac, 'FaceColor', red, 'FaceAlpha',0.4);
+xlabel('cv\_frac'); ylabel('count'); title('MSCC: cv\_frac 분포');
+
+export_png(f, fullfile(fig_dir,'mscc_cvfrac_diagnostics.png'));
+
+%% 8.7) t80 vs T & t80 분포 -----------------------------------------------
+f = figure(213); clf; tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+
+% (a) t80 vs T
+nexttile; hold on; grid on;
+scatter(TM.t80, TM.T, 18, red, 'filled', 'MarkerFaceAlpha',0.35);
+plot([min(TM.t80) max(TM.t80)], [min(TM.t80) max(TM.t80)], '--k','LineWidth',1); % y=x 참고선
+xlabel('t80 (s)'); ylabel('T (s)'); title('MSCC: t80 vs T (y=x reference)');
+
+% (b) t80 분포
+nexttile; hold on; grid on;
+histogram(TM.t80, 'FaceColor', red, 'FaceAlpha',0.4);
+xlabel('t80 (s)'); ylabel('count'); title('MSCC: t80 분포');
+
+export_png(f, fullfile(fig_dir,'mscc_t80_analysis.png'));
+
+%% 8.8) Energy-in vs Speed (E_Wh vs T, colored by s) -----------------------
+f = figure(214); clf; hold on; grid on;
+sz = 26;
+sc = scatter(TM.T, TM.E_Wh, sz, TM.s, 'filled', 'MarkerFaceAlpha',0.5);
+xlabel('T (s)'); ylabel('E_{in} (Wh)'); title('MSCC: E_{in} vs T (colored by s)');
+cb = colorbar; cb.Label.String = 's (V)';
+export_png(f, fullfile(fig_dir,'mscc_energy_vs_time_colored_by_s.png'));
+
+
+%% 8.9) Distribution overview (T, s, Vdiff, C_i) ---------------------------
+f = figure(215); clf; tiledlayout(2,4,'Padding','compact','TileSpacing','compact');
+
+% (a) T, (b) s, (c) Vdiff_min, (d) Vdiff_max
+nexttile; histogram(TM.T,       'FaceColor', red, 'FaceAlpha',0.45); grid on; title('T (s)');       xlabel('T');
+nexttile; histogram(TM.s,       'FaceColor', red, 'FaceAlpha',0.45); grid on; title('s (V)');       xlabel('s');
+nexttile; histogram(TM.Vdiff_min,'FaceColor', red, 'FaceAlpha',0.45); grid on; title('Vdiff_{min}');xlabel('V (min)');
+nexttile; histogram(TM.Vdiff_max,'FaceColor', red, 'FaceAlpha',0.45); grid on; title('Vdiff_{max}');xlabel('V (max)');
+
+% (e-h) C1..C4
+for i=1:4
+    nexttile; histogram(X_mscc(:,i),'FaceColor', red, 'FaceAlpha',0.45); grid on;
+    title(sprintf('C%d 분포', i)); xlabel(sprintf('C%d (C-rate)',i));
+end
+export_png(f, fullfile(fig_dir,'mscc_distribution_overview.png'));
+
+%% 8.10) Parallel coordinates (CSV-based) ----------------------------------
+% 스케일링 + 성공/실패 색상 + T 기반 선굵기
+Z = [X_mscc, TM.T, TM.s];
+Z = (Z - nanmean(Z,1)) ./ nanstd(Z,0,1);      % z-score
+ok = all(isfinite(Z),2);
+Z = Z(ok,:); succOK = (TM.s(ok) > eps_s);
+
+labels = [varNames, {'T','s'}];
+f = figure(216); clf; hold on; grid on;
+h = parallelcoords(Z, 'Labels', labels, 'Group', succOK, ...
+    'Quantile',0.0, 'LineWidth', 0.8, 'Color',[.7 .1 .1; .1 .4 .8]); % 실패:붉은, 성공:파란
+title('MSCC Parallel Coordinates (CSV, succ= s>\epsilon)');
+export_png(f, fullfile(fig_dir,'mscc_parallelcoords_csv.png'));
+
 
 %% 9) 기존 Figure (대표 시계열 CSV 기반) -----------------------------------
 % timeseries 디렉토리에 다음 파일들을 자동 검색 후 그려줌:
