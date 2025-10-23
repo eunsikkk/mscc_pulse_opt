@@ -1,3 +1,4 @@
+
 % =========================================================================
 % Post-Plot for CCCV vs MSCC
 %  - 자동으로 최신 run_* 폴더 탐색 후 CSV 로드
@@ -8,15 +9,31 @@
 % =========================================================================
 clc; clear; close all;
 
-%% 0) 경로 설정 & 최신 run_* 폴더 자동선택
+%% 0) 경로 설정 & run_* 폴더 자동/수동 선택 (토글 가능)
 base_dir = 'G:\공유 드라이브\Battery Software Group (2025)\Members\최은식\COMSOL\MSCC_optimization\MSCC_CCCV_opt';
 assert(isfolder(base_dir), '기본 폴더 없음: %s', base_dir);
 
-% 최신 run_* 폴더 찾기
-d = dir(fullfile(base_dir, 'run_*'));
-assert(~isempty(d), 'run_* 폴더를 찾지 못했습니다. 먼저 최적화 스크립트를 실행해 CSV를 생성하세요.');
-[~,ix] = max([d.datenum]);
-run_dir = fullfile(base_dir, d(ix).name);
+% === 토글 스위치: true면 최신 run_* 자동선택, false면 대화형 선택 ===
+use_latest = false;
+
+if use_latest
+    % ----- 최신 run_* 폴더 자동 선택 -----
+    d = dir(fullfile(base_dir, 'run_*'));
+    assert(~isempty(d), 'run_* 폴더를 찾지 못했습니다. 먼저 최적화 스크립트를 실행해 CSV를 생성하세요.');
+    [~,ix] = max([d.datenum]);
+    run_dir = fullfile(base_dir, d(ix).name);
+else
+    % ----- 대화형 폴더 선택 -----
+    run_dir = uigetdir(base_dir, '분석할 run_* 폴더를 선택하세요');
+    if isstring(run_dir)
+        run_dir = char(run_dir);  % string → char 변환 (MATLAB R2023+ 대응)
+    end
+    assert(~isequal(run_dir, 0), '폴더 선택이 취소되었습니다.');
+    [~, sel_name] = fileparts(run_dir);
+    assert(startsWith(sel_name, 'run_'), '선택한 폴더명이 run_* 형식이 아닙니다: %s', sel_name);
+end
+
+% 하위 폴더/출력 폴더 세팅
 ts_dir  = fullfile(run_dir, 'timeseries');
 fig_dir = fullfile(run_dir, 'figs');
 if ~isfolder(fig_dir), mkdir(fig_dir); end
@@ -29,11 +46,13 @@ fprintf('Using run dir: %s\n', run_dir);
 fprintf('  CCCV log: %s\n', cccv_log);
 fprintf('  MSCC  log: %s\n', mscc_log);
 
+
+
 % 색상
 blue  = [0, 115, 194]/255;   % CCCV
 red   = [205, 83,  76]/255;  % MSCC
 gray  = 0.75*[1 1 1];
-eps_s = 0.01;                % 안전 임계 (s ≤ eps면 위반)
+eps_s = 0.02;                % 안전 임계 (s ≤ eps면 위반)
 
 %% 1) 로그 로드
 TC = readtable(cccv_log);   % [C T s t80 cv_frac E_Wh Vdiff_min Vdiff_max]
@@ -391,130 +410,217 @@ else
         export_png(f, fullfile(fig_dir,'timeseries_Tmax.png'));
     end
 end
+%% 8.opt) OPT-only 시계열 (최적화된 파라미터로 생성된 *_opt.csv 사용) ------
+opt_cccv = fullfile(ts_dir, 'CCCV_opt.csv');
+opt_mscc = fullfile(ts_dir, 'MSCC_opt.csv');
 
-%% 10) FAST-only 비교 (CCCV_fast vs MSCC_fast [+ Pulse_fast])
-% timeseries/ 안의 *_fast.csv만 사용해서 비교
-try
-    fast_fig_dir = fullfile(fig_dir, 'fast_only');
-    if ~isfolder(fast_fig_dir), mkdir(fast_fig_dir); end
+hasOptC = isfile(opt_cccv);
+hasOptM = isfile(opt_mscc);
 
-    % --- 가장 최신 CCCV_fast, MSCC_fast 선택
-    Lc = dir(fullfile(ts_dir,'CCCV_*fast*.csv'));  assert(~isempty(Lc),'CCCV_fast CSV 없음');
-    [~,ix] = max([Lc.datenum]); f_cccv = fullfile(Lc(ix).folder, Lc(ix).name);
-
-    Lm = dir(fullfile(ts_dir,'MSCC_*fast*.csv'));  assert(~isempty(Lm),'MSCC_fast CSV 없음');
-    [~,ix] = max([Lm.datenum]); f_mscc = fullfile(Lm(ix).folder, Lm(ix).name);
-
-    % --- Pulse_fast 있으면 선택(없어도 진행)
-    Lp = [ dir(fullfile(ts_dir,'*pulse*fast*.csv')); ...
-           dir(fullfile(ts_dir,'*Pulse*fast*.csv')); ...
-           dir(fullfile(ts_dir,'MSCC+Pulse_*fast*.csv')) ];
-    hasPulse = ~isempty(Lp);
-    if hasPulse
-        [~,ix] = max([Lp.datenum]); f_pulse = fullfile(Lp(ix).folder, Lp(ix).name);
+if ~(hasOptC || hasOptM)
+    warning('OPT 시계열 CSV가 없습니다. (CCCV_opt.csv / MSCC_opt.csv)');
+else
+    So = struct('name',{},'tbl',{},'color',{});
+    if hasOptC
+        ToC = readtable(opt_cccv);
+        So(end+1).name = 'CCCV_opt'; %#ok<SAGROW>
+        So(end).tbl    = ToC;
+        So(end).color  = blue;
+    end
+    if hasOptM
+        ToM = readtable(opt_mscc);
+        So(end+1).name = 'MSCC_opt'; %#ok<SAGROW>
+        So(end).tbl    = ToM;
+        So(end).color  = red;
     end
 
-    % --- 로드
-    Tcc = readtable(f_cccv);
-    Tms = readtable(f_mscc);
-    if hasPulse, Tpl = readtable(f_pulse); end
-
-    % --- 색상 (위에서 정의한 blue/red 그대로 사용, pulse만 추가)
-    pulse_col = [0, 158, 115]/255;
-
-    % ========== (1) 시간–전압/전류 ==========
-    f = figure(401); clf; hold on; grid on; set(gcf,'Color','w');
-    yyaxis left
-    plot(Tcc.t, Tcc.E_cell,'-','LineWidth',1.5,'Color',blue);
-    plot(Tms.t, Tms.E_cell,'-','LineWidth',1.5,'Color',red);
-    if hasPulse, plot(Tpl.t, Tpl.E_cell,'-','LineWidth',1.5,'Color',pulse_col); end
-    ylabel('Voltage (V)');
-
-    yyaxis right
-    plot(Tcc.t, Tcc.I_cell,'--','LineWidth',1.3,'Color',blue);
-    plot(Tms.t, Tms.I_cell,'--','LineWidth',1.3,'Color',red);
-    if hasPulse, plot(Tpl.t, Tpl.I_cell,'--','LineWidth',1.3,'Color',pulse_col); end
-    ylabel('Current (A)');
-
-    xlabel('Time (s)'); title('FAST only: Time–Voltage/Current');
-    if hasPulse
-        legend({'CCCV(V)','MSCC(V)','MSCC+Pulse(V)','CCCV(I)','MSCC(I)','MSCC+Pulse(I)'},'Location','best');
-    else
-        legend({'CCCV(V)','MSCC(V)','CCCV(I)','MSCC(I)'},'Location','best');
+    % (1) 시간–전압/전류
+    f = figure(310); clf; hold on; grid on;
+    for k=1:numel(So)
+        t=So(k).tbl.t; V=So(k).tbl.E_cell; I=So(k).tbl.I_cell;
+        yyaxis left;  plot(t,V,'-','LineWidth',1.8,'Color',So(k).color,'DisplayName',[So(k).name ' V']);
+        yyaxis right; plot(t,I,'--','LineWidth',1.4,'Color',So(k).color,'DisplayName',[So(k).name ' I']);
     end
-    export_png(f, fullfile(fast_fig_dir,'fast_time_VI.png'));
+    yyaxis left;  ylabel('V (V)');
+    yyaxis right; ylabel('I (A)');
+    xlabel('t (s)'); title('OPT-only: Time–Voltage/Current');
+    legend('Location','best'); export_png(f, fullfile(fig_dir,'opt_time_VI.png'));
 
-    % ========== (2) SOC–과전압 ==========
-    f = figure(402); clf; hold on; grid on; set(gcf,'Color','w');
-    plot(Tcc.SOC, Tcc.phis_minus_phil,'LineWidth',1.5,'Color',blue);
-    plot(Tms.SOC, Tms.phis_minus_phil,'LineWidth',1.5,'Color',red);
-    if hasPulse, plot(Tpl.SOC, Tpl.phis_minus_phil,'LineWidth',1.5,'Color',pulse_col); end
-    xlabel('SOC'); ylabel('\phi_s - \phi_l (V)');
-    title('FAST only: SOC–Overpotential');
-    if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
-    else,        legend({'CCCV','MSCC'},'Location','best'); end
-    export_png(f, fullfile(fast_fig_dir,'fast_SOC_overpot.png'));
+    % (2) SOC–과전압
+    f = figure(311); clf; hold on; grid on;
+    for k=1:numel(So)
+        plot(So(k).tbl.SOC, So(k).tbl.phis_minus_phil, 'LineWidth',1.8,'Color',So(k).color, 'DisplayName', So(k).name);
+    end
+    xlabel('SOC'); ylabel('\phi_s-\phi_l (V)'); title('OPT-only: SOC–Overpotential');
+    legend('Location','best'); export_png(f, fullfile(fig_dir,'opt_SOC_overpot.png'));
 
-    % ========== (3) 시간–과전압 ==========
-    f = figure(403); clf; hold on; grid on; set(gcf,'Color','w');
-    plot(Tcc.t, Tcc.phis_minus_phil,'LineWidth',1.5,'Color',blue);
-    plot(Tms.t, Tms.phis_minus_phil,'LineWidth',1.5,'Color',red);
-    if hasPulse, plot(Tpl.t, Tpl.phis_minus_phil,'LineWidth',1.5,'Color',pulse_col); end
-    xlabel('Time (s)'); ylabel('\phi_s - \phi_l (V)');
-    title('FAST only: Time–Overpotential');
-    if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
-    else,        legend({'CCCV','MSCC'},'Location','best'); end
-    export_png(f, fullfile(fast_fig_dir,'fast_time_overpot.png'));
+    % (3) 시간–과전압
+    f = figure(312); clf; hold on; grid on;
+    for k=1:numel(So)
+        plot(So(k).tbl.t, So(k).tbl.phis_minus_phil, 'LineWidth',1.8,'Color',So(k).color, 'DisplayName', So(k).name);
+    end
+    xlabel('t (s)'); ylabel('\phi_s-\phi_l (V)'); title('OPT-only: Time–Overpotential');
+    legend('Location','best'); export_png(f, fullfile(fig_dir,'opt_time_overpot.png'));
 
-    % ========== (4) 누적 에너지 (Wh) ==========
-    Ecc = cumtrapz(Tcc.t, Tcc.E_cell .* Tcc.I_cell)/3600;
-    Ems = cumtrapz(Tms.t, Tms.E_cell .* Tms.I_cell)/3600;
-    if hasPulse, Epl = cumtrapz(Tpl.t, Tpl.E_cell .* Tpl.I_cell)/3600; end
+    % (4) 누적 에너지
+    f = figure(313); clf; hold on; grid on;
+    for k=1:numel(So)
+        t=So(k).tbl.t; V=So(k).tbl.E_cell; I=So(k).tbl.I_cell;
+        E = cumtrapz(t, V.*I)/3600;
+        plot(t, E, 'LineWidth',1.8,'Color',So(k).color,'DisplayName',So(k).name);
+    end
+    xlabel('t (s)'); ylabel('E (Wh)'); title('OPT-only: Cumulative Energy');
+    legend('Location','best'); export_png(f, fullfile(fig_dir,'opt_cum_energy.png'));
 
-    f = figure(404); clf; hold on; grid on; set(gcf,'Color','w');
-    plot(Tcc.t, Ecc,'LineWidth',1.5,'Color',blue);
-    plot(Tms.t, Ems,'LineWidth',1.5,'Color',red);
-    if hasPulse, plot(Tpl.t, Epl,'LineWidth',1.5,'Color',pulse_col); end
-    xlabel('Time (s)'); ylabel('Cumulative Energy (Wh)');
-    title('FAST only: Cumulative Energy');
-    if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
-    else,        legend({'CCCV','MSCC'},'Location','best'); end
-    export_png(f, fullfile(fast_fig_dir,'fast_cum_energy.png'));
-
-    % ========== (5) 온도 (있으면) ==========
-    hasTavg = ismember('T_avg', Tcc.Properties.VariableNames) || ...
-              ismember('T_avg', Tms.Properties.VariableNames) || ...
-              (hasPulse && ismember('T_avg', Tpl.Properties.VariableNames));
+    % (5) 온도(있으면)
+    hasTavg = any(strcmpi('T_avg', So(1).tbl.Properties.VariableNames));
+    hasTmax = any(strcmpi('T_max', So(1).tbl.Properties.VariableNames));
     if hasTavg
-        f = figure(405); clf; hold on; grid on; set(gcf,'Color','w');
-        if ismember('T_avg', Tcc.Properties.VariableNames), plot(Tcc.t, Tcc.T_avg,'LineWidth',1.4,'Color',blue); end
-        if ismember('T_avg', Tms.Properties.VariableNames), plot(Tms.t, Tms.T_avg,'LineWidth',1.4,'Color',red); end
-        if hasPulse && ismember('T_avg', Tpl.Properties.VariableNames), plot(Tpl.t, Tpl.T_avg,'LineWidth',1.4,'Color',pulse_col); end
-        xlabel('Time (s)'); ylabel('T_{avg} (K)'); title('FAST only: Average Temperature');
-        if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
-        else,        legend({'CCCV','MSCC'},'Location','best'); end
-        export_png(f, fullfile(fast_fig_dir,'fast_Tavg.png'));
+        f = figure(314); clf; hold on; grid on;
+        for k=1:numel(So)
+            if ismember('T_avg', So(k).tbl.Properties.VariableNames)
+                plot(So(k).tbl.t, So(k).tbl.T_avg, 'LineWidth',1.6,'Color',So(k).color, 'DisplayName', So(k).name);
+            end
+        end
+        xlabel('t (s)'); ylabel('T_{avg} (K)'); title('OPT-only: Average Temperature');
+        legend('Location','best'); export_png(f, fullfile(fig_dir,'opt_Tavg.png'));
     end
-
-    hasTmax = ismember('T_max', Tcc.Properties.VariableNames) || ...
-              ismember('T_max', Tms.Properties.VariableNames) || ...
-              (hasPulse && ismember('T_max', Tpl.Properties.VariableNames));
     if hasTmax
-        f = figure(406); clf; hold on; grid on; set(gcf,'Color','w');
-        if ismember('T_max', Tcc.Properties.VariableNames), plot(Tcc.t, Tcc.T_max,'LineWidth',1.4,'Color',blue); end
-        if ismember('T_max', Tms.Properties.VariableNames), plot(Tms.t, Tms.T_max,'LineWidth',1.4,'Color',red); end
-        if hasPulse && ismember('T_max', Tpl.Properties.VariableNames), plot(Tpl.t, Tpl.T_max,'LineWidth',1.4,'Color',pulse_col); end
-        xlabel('Time (s)'); ylabel('T_{max} (K)'); title('FAST only: Max Temperature');
-        if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
-        else,        legend({'CCCV','MSCC'},'Location','best'); end
-        export_png(f, fullfile(fast_fig_dir,'fast_Tmax.png'));
+        f = figure(315); clf; hold on; grid on;
+        for k=1:numel(So)
+            if ismember('T_max', So(k).tbl.Properties.VariableNames)
+                plot(So(k).tbl.t, So(k).tbl.T_max, 'LineWidth',1.6,'Color',So(k).color, 'DisplayName', So(k).name);
+            end
+        end
+        xlabel('t (s)'); ylabel('T_{max} (K)'); title('OPT-only: Max Temperature');
+        legend('Location','best'); export_png(f, fullfile(fig_dir,'opt_Tmax.png'));
     end
-
-    fprintf('완료: %s 에 FAST-only 비교 PNG 저장됨.\n', fast_fig_dir);
-
-catch ME
-    warning('FAST-only 비교 섹션 오류: %s', ME.message);
 end
+
+
+% %% 10) FAST-only 비교 (CCCV_fast vs MSCC_fast [+ Pulse_fast])
+% % timeseries/ 안의 *_fast.csv만 사용해서 비교
+% try
+%     fast_fig_dir = fullfile(fig_dir, 'fast_only');
+%     if ~isfolder(fast_fig_dir), mkdir(fast_fig_dir); end
+% 
+%     % --- 가장 최신 CCCV_fast, MSCC_fast 선택
+%     Lc = dir(fullfile(ts_dir,'CCCV_*fast*.csv'));  assert(~isempty(Lc),'CCCV_fast CSV 없음');
+%     [~,ix] = max([Lc.datenum]); f_cccv = fullfile(Lc(ix).folder, Lc(ix).name);
+% 
+%     Lm = dir(fullfile(ts_dir,'MSCC_*fast*.csv'));  assert(~isempty(Lm),'MSCC_fast CSV 없음');
+%     [~,ix] = max([Lm.datenum]); f_mscc = fullfile(Lm(ix).folder, Lm(ix).name);
+% 
+%     % --- Pulse_fast 있으면 선택(없어도 진행)
+%     Lp = [ dir(fullfile(ts_dir,'*pulse*fast*.csv')); ...
+%            dir(fullfile(ts_dir,'*Pulse*fast*.csv')); ...
+%            dir(fullfile(ts_dir,'MSCC+Pulse_*fast*.csv')) ];
+%     hasPulse = ~isempty(Lp);
+%     if hasPulse
+%         [~,ix] = max([Lp.datenum]); f_pulse = fullfile(Lp(ix).folder, Lp(ix).name);
+%     end
+% 
+%     % --- 로드
+%     Tcc = readtable(f_cccv);
+%     Tms = readtable(f_mscc);
+%     if hasPulse, Tpl = readtable(f_pulse); end
+% 
+%     % --- 색상 (위에서 정의한 blue/red 그대로 사용, pulse만 추가)
+%     pulse_col = [0, 158, 115]/255;
+% 
+%     % ========== (1) 시간–전압/전류 ==========
+%     f = figure(401); clf; hold on; grid on; set(gcf,'Color','w');
+%     yyaxis left
+%     plot(Tcc.t, Tcc.E_cell,'-','LineWidth',1.5,'Color',blue);
+%     plot(Tms.t, Tms.E_cell,'-','LineWidth',1.5,'Color',red);
+%     if hasPulse, plot(Tpl.t, Tpl.E_cell,'-','LineWidth',1.5,'Color',pulse_col); end
+%     ylabel('Voltage (V)');
+% 
+%     yyaxis right
+%     plot(Tcc.t, Tcc.I_cell,'--','LineWidth',1.3,'Color',blue);
+%     plot(Tms.t, Tms.I_cell,'--','LineWidth',1.3,'Color',red);
+%     if hasPulse, plot(Tpl.t, Tpl.I_cell,'--','LineWidth',1.3,'Color',pulse_col); end
+%     ylabel('Current (A)');
+% 
+%     xlabel('Time (s)'); title('FAST only: Time–Voltage/Current');
+%     if hasPulse
+%         legend({'CCCV(V)','MSCC(V)','MSCC+Pulse(V)','CCCV(I)','MSCC(I)','MSCC+Pulse(I)'},'Location','best');
+%     else
+%         legend({'CCCV(V)','MSCC(V)','CCCV(I)','MSCC(I)'},'Location','best');
+%     end
+%     export_png(f, fullfile(fast_fig_dir,'fast_time_VI.png'));
+% 
+%     % ========== (2) SOC–과전압 ==========
+%     f = figure(402); clf; hold on; grid on; set(gcf,'Color','w');
+%     plot(Tcc.SOC, Tcc.phis_minus_phil,'LineWidth',1.5,'Color',blue);
+%     plot(Tms.SOC, Tms.phis_minus_phil,'LineWidth',1.5,'Color',red);
+%     if hasPulse, plot(Tpl.SOC, Tpl.phis_minus_phil,'LineWidth',1.5,'Color',pulse_col); end
+%     xlabel('SOC'); ylabel('\phi_s - \phi_l (V)');
+%     title('FAST only: SOC–Overpotential');
+%     if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
+%     else,        legend({'CCCV','MSCC'},'Location','best'); end
+%     export_png(f, fullfile(fast_fig_dir,'fast_SOC_overpot.png'));
+% 
+%     % ========== (3) 시간–과전압 ==========
+%     f = figure(403); clf; hold on; grid on; set(gcf,'Color','w');
+%     plot(Tcc.t, Tcc.phis_minus_phil,'LineWidth',1.5,'Color',blue);
+%     plot(Tms.t, Tms.phis_minus_phil,'LineWidth',1.5,'Color',red);
+%     if hasPulse, plot(Tpl.t, Tpl.phis_minus_phil,'LineWidth',1.5,'Color',pulse_col); end
+%     xlabel('Time (s)'); ylabel('\phi_s - \phi_l (V)');
+%     title('FAST only: Time–Overpotential');
+%     if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
+%     else,        legend({'CCCV','MSCC'},'Location','best'); end
+%     export_png(f, fullfile(fast_fig_dir,'fast_time_overpot.png'));
+% 
+%     % ========== (4) 누적 에너지 (Wh) ==========
+%     Ecc = cumtrapz(Tcc.t, Tcc.E_cell .* Tcc.I_cell)/3600;
+%     Ems = cumtrapz(Tms.t, Tms.E_cell .* Tms.I_cell)/3600;
+%     if hasPulse, Epl = cumtrapz(Tpl.t, Tpl.E_cell .* Tpl.I_cell)/3600; end
+% 
+%     f = figure(404); clf; hold on; grid on; set(gcf,'Color','w');
+%     plot(Tcc.t, Ecc,'LineWidth',1.5,'Color',blue);
+%     plot(Tms.t, Ems,'LineWidth',1.5,'Color',red);
+%     if hasPulse, plot(Tpl.t, Epl,'LineWidth',1.5,'Color',pulse_col); end
+%     xlabel('Time (s)'); ylabel('Cumulative Energy (Wh)');
+%     title('FAST only: Cumulative Energy');
+%     if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
+%     else,        legend({'CCCV','MSCC'},'Location','best'); end
+%     export_png(f, fullfile(fast_fig_dir,'fast_cum_energy.png'));
+% 
+%     % ========== (5) 온도 (있으면) ==========
+%     hasTavg = ismember('T_avg', Tcc.Properties.VariableNames) || ...
+%               ismember('T_avg', Tms.Properties.VariableNames) || ...
+%               (hasPulse && ismember('T_avg', Tpl.Properties.VariableNames));
+%     if hasTavg
+%         f = figure(405); clf; hold on; grid on; set(gcf,'Color','w');
+%         if ismember('T_avg', Tcc.Properties.VariableNames), plot(Tcc.t, Tcc.T_avg,'LineWidth',1.4,'Color',blue); end
+%         if ismember('T_avg', Tms.Properties.VariableNames), plot(Tms.t, Tms.T_avg,'LineWidth',1.4,'Color',red); end
+%         if hasPulse && ismember('T_avg', Tpl.Properties.VariableNames), plot(Tpl.t, Tpl.T_avg,'LineWidth',1.4,'Color',pulse_col); end
+%         xlabel('Time (s)'); ylabel('T_{avg} (K)'); title('FAST only: Average Temperature');
+%         if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
+%         else,        legend({'CCCV','MSCC'},'Location','best'); end
+%         export_png(f, fullfile(fast_fig_dir,'fast_Tavg.png'));
+%     end
+% 
+%     hasTmax = ismember('T_max', Tcc.Properties.VariableNames) || ...
+%               ismember('T_max', Tms.Properties.VariableNames) || ...
+%               (hasPulse && ismember('T_max', Tpl.Properties.VariableNames));
+%     if hasTmax
+%         f = figure(406); clf; hold on; grid on; set(gcf,'Color','w');
+%         if ismember('T_max', Tcc.Properties.VariableNames), plot(Tcc.t, Tcc.T_max,'LineWidth',1.4,'Color',blue); end
+%         if ismember('T_max', Tms.Properties.VariableNames), plot(Tms.t, Tms.T_max,'LineWidth',1.4,'Color',red); end
+%         if hasPulse && ismember('T_max', Tpl.Properties.VariableNames), plot(Tpl.t, Tpl.T_max,'LineWidth',1.4,'Color',pulse_col); end
+%         xlabel('Time (s)'); ylabel('T_{max} (K)'); title('FAST only: Max Temperature');
+%         if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
+%         else,        legend({'CCCV','MSCC'},'Location','best'); end
+%         export_png(f, fullfile(fast_fig_dir,'fast_Tmax.png'));
+%     end
+% 
+%     fprintf('완료: %s 에 FAST-only 비교 PNG 저장됨.\n', fast_fig_dir);
+% 
+% catch ME
+%     warning('FAST-only 비교 섹션 오류: %s', ME.message);
+% end
 
 disp('완료: figs/ 폴더에 모든 PNG가 저장되었습니다.');
 
