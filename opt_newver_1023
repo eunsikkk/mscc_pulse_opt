@@ -1,0 +1,320 @@
+% =========================================================================
+% COMSOL-MATLAB: One-Run Optimization → All CSVs for Post Figures (+ 최적해 CSV/시계열)
+%   - Protocols: CCCV (std1,dset1, param 'C_rate')
+%                MSCC (std2,dset3, params 'first_MSCC_Crate'..'fourth_MSCC_Crate')
+%   - Trial Log CSVs:
+%       cccv_optimization_log_yyyymmdd_HHMMSS.csv  [C, T, s, t80, cv_frac, E_Wh, Vdiff_min, Vdiff_max]
+%       mscc_optimization_log_yyyymmdd_HHMMSS.csv  [C1 C2 C3 C4 T s t80 cv_frac E_Wh Vdiff_min Vdiff_max]
+%   - Pareto 대표 3점 시계열 CSV:
+%       timeseries/CCCV_[fast|safe|knee].csv
+%       timeseries/MSCC_[fast|safe|knee].csv
+%   - 추가(본 스크립트):
+%       out_dir/optimal_params.csv      ← 최적해(안전 만족 + T 최소) 요약 2행(CCCV/MSCC)
+%       timeseries/CCCV_opt.csv         ← 최적해로 재실행한 시계열
+%       timeseries/MSCC_opt.csv         ← 최적해로 재실행한 시계열
+% =========================================================================
+clc; clear; close all;
+import com.comsol.model.*
+import com.comsol.model.util.*
+
+%% 0) 경로/출력 폴더 설정 ---------------------------------------------------
+base_dir = 'G:\공유 드라이브\Battery Software Group (2025)\Members\최은식\COMSOL\MSCC_optimization\MSCC_CCCV_opt';
+if ~isfolder(base_dir), error('기본 폴더가 없습니다: %s', base_dir); end
+ts = datestr(now,'yyyymmdd_HHMMSS');
+out_dir = fullfile(base_dir, ['run_' ts]);
+ts_dir = fullfile(out_dir, 'timeseries');
+if ~isfolder(out_dir), mkdir(out_dir); end
+if ~isfolder(ts_dir), mkdir(ts_dir); end
+
+fn_cccv = fullfile(out_dir, ['cccv_optimization_log_' ts '.csv']);
+fn_mscc = fullfile(out_dir, ['mscc_optimization_log_' ts '.csv']);
+fn_opt  = fullfile(out_dir, 'optimal_params.csv');   % ★ 최적해 요약 CSV
+
+% 안전 임계 및 surrogateopt 평가 횟수
+safety_eps = 0.02;     % [V]  ← 포스트분석 eps_s와 맞추면 해석 일관성↑
+N_EVALS    = 100;      % surrogateopt MaxFunctionEvaluations
+
+%% 1) 모델 로드 -------------------------------------------------------------
+filepath = 'G:\공유 드라이브\COMSOL\fast_charging';
+filename = 'ES_MSCC_PC_1015.mph';
+full_path = fullfile(filepath, filename);
+model = mphload(full_path);
+ModelUtil.showProgress(true);
+disp('모델 불러오기 완료.');
+
+%% 2) 로그 헤더 생성 (없으면 생성) ------------------------------------------
+if ~isfile(fn_cccv)
+    T = table('Size',[0 8], 'VariableTypes', ...
+        {'double','double','double','double','double','double','double','double'}, ...
+        'VariableNames', {'C','T','s','t80','cv_frac','E_Wh','Vdiff_min','Vdiff_max'});
+    writetable(T, fn_cccv);
+end
+if ~isfile(fn_mscc)
+    T = table('Size',[0 11], 'VariableTypes', ...
+        {'double','double','double','double','double','double','double','double','double','double','double'}, ...
+        'VariableNames', {'C1','C2','C3','C4','T','s','t80','cv_frac','E_Wh','Vdiff_min','Vdiff_max'});
+    writetable(T, fn_mscc);
+end
+
+%% 3) 최적화: CCCV ----------------------------------------------------------
+disp('===== CCCV 최적화를 시작합니다 =====');
+lb_cccv = 0.1;  ub_cccv = 6.0;
+obj_cccv = @(C) evaluate_and_log_CCCV(C, model, safety_eps, fn_cccv);
+
+opts_cccv = optimoptions('surrogateopt', ...
+    'MaxFunctionEvaluations', N_EVALS, ...
+    'Display','iter', 'PlotFcn','surrogateoptplot');
+
+[optimal_C_rate, cccv_min_time, exitflag_cccv, output_cccv, trials_cccv] = ...
+    surrogateopt(obj_cccv, lb_cccv, ub_cccv, opts_cccv);
+
+fprintf('\n--- CCCV 최적화 결과 ---\n');
+fprintf('최적 CCCV 충전 시간: %.2f s\n', cccv_min_time);
+fprintf('최적 C-rate: %.4g C\n\n', optimal_C_rate);
+
+%% 4) 최적화: MSCC ----------------------------------------------------------
+disp('===== MSCC 최적화를 시작합니다 =====');
+lb_mscc = [0.1 0.1 0.1 0.1];
+ub_mscc = [6.0 6.0 6.0 6.0];
+obj_mscc = @(C) evaluate_and_log_MSCC(C, model, safety_eps, fn_mscc);
+
+opts_mscc = optimoptions('surrogateopt', ...
+    'MaxFunctionEvaluations', N_EVALS, ...
+    'Display','iter', 'PlotFcn','surrogateoptplot');
+
+[optimal_C_mscc, mscc_min_time, exitflag_mscc, output_mscc, trials_mscc] = ...
+    surrogateopt(obj_mscc, lb_mscc, ub_mscc, opts_mscc);
+
+fprintf('\n--- MSCC 최적화 결과 ---\n');
+fprintf('최적 MSCC 충전 시간: %.2f s\n', mscc_min_time);
+fprintf('최적 C-rate 조합: [%.4g %.4g %.4g %.4g]\n\n', optimal_C_mscc);
+
+%% 5) 파레토 대표 3점 뽑고 → 시계열 CSV 저장 -------------------------------
+% 공통 유틸
+isND = @(F) arrayfun(@(i) ~any(all(bsxfun(@le,F, F(i,:)) & bsxfun(@lt,F, F(i,:)),2)), 1:size(F,1))';
+pick3 = @(T,s) pick3_indices(T,s);
+
+% --- CCCV 로그 로드
+L_C = readmatrix(fn_cccv);   % [C,T,s,t80,cv_frac,E_Wh,Vdiff_min,Vdiff_max]
+C_all = L_C(:,1); T_all=L_C(:,2); s_all=L_C(:,3);
+maskC = isND([T_all, -s_all]);
+T_nd  = T_all(maskC); s_nd = s_all(maskC); C_nd = C_all(maskC);
+[~,ord] = sort(T_nd,'ascend');
+T_nd=T_nd(ord); s_nd=s_nd(ord); C_nd=C_nd(ord);
+[i_fast, i_safe, i_knee] = pick3(T_nd, s_nd);
+% 대표 3점 시계열 저장
+if ~isempty(i_fast)
+    dump_timeseries_CCCV(model, C_nd(i_fast), fullfile(ts_dir, 'CCCV_fast.csv'));
+    dump_timeseries_CCCV(model, C_nd(i_safe), fullfile(ts_dir, 'CCCV_safe.csv'));
+    dump_timeseries_CCCV(model, C_nd(i_knee), fullfile(ts_dir, 'CCCV_knee.csv'));
+end
+
+% --- MSCC 로그 로드
+L_M = readmatrix(fn_mscc);   % [C1 C2 C3 C4 T s ...]
+Cmat = L_M(:,1:4); Tm=L_M(:,5); sm=L_M(:,6);
+maskM = isND([Tm, -sm]);
+Tm_nd = Tm(maskM); sm_nd = sm(maskM); Cmat_nd = Cmat(maskM,:);
+[~,ord] = sort(Tm_nd,'ascend');
+Tm_nd=Tm_nd(ord); sm_nd=sm_nd(ord); Cmat_nd=Cmat_nd(ord,:);
+[i_fast, i_safe, i_knee] = pick3(Tm_nd, sm_nd);
+% 대표 3점 시계열 저장
+if ~isempty(i_fast)
+    dump_timeseries_MSCC(model, Cmat_nd(i_fast,:), fullfile(ts_dir, 'MSCC_fast.csv'));
+    dump_timeseries_MSCC(model, Cmat_nd(i_safe,:), fullfile(ts_dir, 'MSCC_safe.csv'));
+    dump_timeseries_MSCC(model, Cmat_nd(i_knee,:), fullfile(ts_dir, 'MSCC_knee.csv'));
+end
+
+%% 5.5) ★ 최적해(안전 만족 + T 최소) 추출 → optimal_params.csv 기록 ---------
+% CCCV: s > safety_eps 이면서 T가 최소인 행
+mask_feas_C = isfinite(T_all) & isfinite(s_all) & (s_all > safety_eps);
+assert(any(mask_feas_C), 'CCCV: s>eps 만족 로우가 없습니다.');
+[~,relIdxC] = min(T_all(mask_feas_C));
+absIdxC = find(mask_feas_C); absIdxC = absIdxC(relIdxC);
+
+C_opt   = C_all(absIdxC);
+T_opt_C = T_all(absIdxC);
+s_opt_C = s_all(absIdxC);
+t80_opt_C     = L_C(absIdxC,4);
+cvfrac_opt_C  = L_C(absIdxC,5);
+Ewh_opt_C     = L_C(absIdxC,6);
+Vmin_opt_C    = L_C(absIdxC,7);
+Vmax_opt_C    = L_C(absIdxC,8);
+
+% MSCC: s > safety_eps 이면서 T가 최소인 행
+mask_feas_M = isfinite(Tm) & isfinite(sm) & (sm > safety_eps);
+assert(any(mask_feas_M), 'MSCC: s>eps 만족 로우가 없습니다.');
+[~,relIdxM] = min(Tm(mask_feas_M));
+absIdxM = find(mask_feas_M); absIdxM = absIdxM(relIdxM);
+
+C_opt_vec    = Cmat(absIdxM,:); % [C1 C2 C3 C4]
+T_opt_M      = Tm(absIdxM);
+s_opt_M      = sm(absIdxM);
+t80_opt_M    = L_M(absIdxM,7);
+cvfrac_opt_M = L_M(absIdxM,8);
+Ewh_opt_M    = L_M(absIdxM,9);
+Vmin_opt_M   = L_M(absIdxM,10);
+Vmax_opt_M   = L_M(absIdxM,11);
+
+% optimal_params.csv 작성(2행: CCCV, MSCC)
+OptTbl = table( ...
+    ["CCCV"; "MSCC"], ...
+    [C_opt; NaN], ...
+    [NaN; C_opt_vec(1)], [NaN; C_opt_vec(2)], [NaN; C_opt_vec(3)], [NaN; C_opt_vec(4)], ...
+    [T_opt_C; T_opt_M], [s_opt_C; s_opt_M], ...
+    [t80_opt_C; t80_opt_M], [cvfrac_opt_C; cvfrac_opt_M], [Ewh_opt_C; Ewh_opt_M], ...
+    [Vmin_opt_C; Vmin_opt_M], [Vmax_opt_C; Vmax_opt_M], ...
+    'VariableNames', {'Protocol','C','C1','C2','C3','C4','T','s','t80','cv_frac','E_Wh','Vdiff_min','Vdiff_max'} ...
+);
+writetable(OptTbl, fn_opt);
+fprintf('저장: %s (최적해 요약 2행)\n', fn_opt);
+
+%% 5.6) ★ 최적해 시계열도 생성 (CCCV_opt.csv / MSCC_opt.csv) ---------------
+dump_timeseries_CCCV(model, C_opt,             fullfile(ts_dir, 'CCCV_opt.csv'));
+dump_timeseries_MSCC(model, C_opt_vec,         fullfile(ts_dir, 'MSCC_opt.csv'));
+fprintf('저장: %s\n  - CCCV_opt.csv\n  - MSCC_opt.csv\n', ts_dir);
+
+%% 6) 요약 MAT 저장 ---------------------------------------------------------
+save(fullfile(out_dir, ['run_summary_' ts '.mat']), ...
+    'optimal_C_rate','cccv_min_time','trials_cccv','exitflag_cccv','output_cccv', ...
+    'optimal_C_mscc','mscc_min_time','trials_mscc','exitflag_mscc','output_mscc', ...
+    'fn_cccv','fn_mscc','fn_opt','safety_eps','N_EVALS');
+
+fprintf('CSV/MAT 저장 완료.\n출력 폴더: %s\n', out_dir);
+
+% ============================ Local Functions =============================
+function cost = evaluate_and_log_CCCV(C_rate, model, safety_eps, fn_csv)
+    % 시뮬레이션
+    model.param.set('C_rate', num2str(C_rate));
+    model.study('std1').run();
+    expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil','liion.cdc1.CC_CH','liion.cdc1.CV_CH','T_avg','T_max'};
+    data = mpheval(model, expr, 'dataset','dset1','edim','point','selection',2,'solnum','all');
+
+    t=data.d1; V=data.d2; I=data.d3; soc=data.d4; vdiff=data.d5; cc=data.d6; cv=data.d7;
+    try, Tavg=data.d8; Tmax=data.d9; catch, Tavg=nan(size(t)); Tmax=nan(size(t)); end
+
+    idx = (cc==1) | (cv==1);
+    if ~any(idx)
+        T = 1e6; s = -inf; t80=nan; cv_frac=nan; E_Wh=nan; vmin=nan; vmax=nan;
+        append_cccv_row(fn_csv, [C_rate, T, s, t80, cv_frac, E_Wh, vmin, vmax]);
+        cost = T; return;
+    end
+
+    tchg = t(idx); Vchg=V(idx); Ichg=I(idx); SOCchg=soc(idx); vchg=vdiff(idx); ccchg=cc(idx); cvchg=cv(idx);
+    T    = tchg(end);
+    s    = min(vchg);
+    i80  = find(SOCchg >= 0.80, 1, 'first');
+    t80  = ~isempty(i80) * tchg(min(i80,end)) + isempty(i80) * nan;
+    cv_frac = mean(cvchg==1);
+    E_Wh = trapz(tchg, Vchg.*Ichg)/3600;
+    vmin = min(vchg); vmax = max(vchg);
+
+    if s <= safety_eps
+        cost = 1e6 + (safety_eps - s)*1e5;
+    else
+        cost = T;
+    end
+
+    append_cccv_row(fn_csv, [C_rate, T, s, t80, cv_frac, E_Wh, vmin, vmax]);
+end
+
+function cost = evaluate_and_log_MSCC(C, model, safety_eps, fn_csv)
+    % 시뮬레이션
+    model.param.set('first_MSCC_Crate',  num2str(C(1)));
+    model.param.set('second_MSCC_Crate', num2str(C(2)));
+    model.param.set('third_MSCC_Crate',  num2str(C(3)));
+    model.param.set('fourth_MSCC_Crate', num2str(C(4)));
+    model.study('std2').run();
+    expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil','liion.cdc1.CC_CH','liion.cdc1.CV_CH','T_avg','T_max'};
+    data = mpheval(model, expr, 'dataset','dset3','edim','point','selection',2,'solnum','all');
+
+    t=data.d1; V=data.d2; I=data.d3; soc=data.d4; vdiff=data.d5; cc=data.d6; cv=data.d7;
+    try, Tavg=data.d8; Tmax=data.d9; catch, Tavg=nan(size(t)); Tmax=nan(size(t)); end
+
+    idx = (cc==1) | (cv==1);
+    if ~any(idx)
+        T = 1e6; s = -inf; t80=nan; cv_frac=nan; E_Wh=nan; vmin=nan; vmax=nan;
+        append_mscc_row(fn_csv, [C(:).', T, s, t80, cv_frac, E_Wh, vmin, vmax]);
+        cost = T; return;
+    end
+
+    tchg = t(idx); Vchg=V(idx); Ichg=I(idx); SOCchg=soc(idx); vchg=vdiff(idx); ccchg=cc(idx); cvchg=cv(idx);
+    T    = tchg(end);
+    s    = min(vchg);
+    i80  = find(SOCchg >= 0.80, 1, 'first');
+    t80  = ~isempty(i80) * tchg(min(i80,end)) + isempty(i80) * nan;
+    cv_frac = mean(cvchg==1);
+    E_Wh = trapz(tchg, Vchg.*Ichg)/3600;
+    vmin = min(vchg); vmax = max(vchg);
+
+    if s <= safety_eps
+        cost = 1e6 + (safety_eps - s)*1e5;
+    else
+        cost = T;
+    end
+
+    append_mscc_row(fn_csv, [C(:).', T, s, t80, cv_frac, E_Wh, vmin, vmax]);
+end
+
+function append_cccv_row(fn, row)
+    % [C, T, s, t80, cv_frac, E_Wh, Vdiff_min, Vdiff_max]
+    T = table(row(1),row(2),row(3),row(4),row(5),row(6),row(7),row(8), ...
+        'VariableNames', {'C','T','s','t80','cv_frac','E_Wh','Vdiff_min','Vdiff_max'});
+    writetable(T, fn, 'WriteMode','Append');
+end
+
+function append_mscc_row(fn, row)
+    % [C1 C2 C3 C4 T s t80 cv_frac E_Wh Vdiff_min Vdiff_max]
+    T = table(row(1),row(2),row(3),row(4),row(5),row(6),row(7),row(8),row(9),row(10),row(11), ...
+        'VariableNames', {'C1','C2','C3','C4','T','s','t80','cv_frac','E_Wh','Vdiff_min','Vdiff_max'});
+    writetable(T, fn, 'WriteMode','Append');
+end
+
+function [i_fast, i_safe, i_knee] = pick3_indices(T, s)
+    if isempty(T), i_fast=[]; i_safe=[]; i_knee=[]; return; end
+    [~, i_fast] = min(T);
+    [~, i_safe] = max(s);
+    % 무릎점: fast–safe 선분에 대한 수직거리 최대
+    Tn=(T-min(T))/max(eps,(max(T)-min(T))); sn=(s-min(s))/max(eps,(max(s)-min(s)));
+    p1=[Tn(i_fast),sn(i_fast)]; p2=[Tn(i_safe),sn(i_safe)];
+    if norm(p2-p1)<1e-12, i_knee=i_fast; return; end
+    v=p2-p1; dist=zeros(size(Tn));
+    for k=1:numel(Tn)
+        w=[Tn(k),sn(k)]-p1; proj=dot(w,v)/dot(v,v)*v; perp=w-proj; dist(k)=norm(perp);
+    end
+    mask=true(size(dist)); mask([i_fast,i_safe])=false;
+    [~,i_knee]=max(dist.*mask);
+    if isempty(i_knee) || i_knee==0, i_knee=i_fast; end
+end
+
+function dump_timeseries_CCCV(model, C_rate, fn_csv)
+    % 해당 C_rate로 재실행 후 시계열 CSV 저장
+    model.param.set('C_rate', num2str(C_rate));
+    model.study('std1').run();
+    expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil','liion.cdc1.CC_CH','liion.cdc1.CV_CH','T_avg','T_max'};
+    data = mpheval(model, expr, 'dataset','dset1','edim','point','selection',2,'solnum','all');
+    tbl = table(data.d1, data.d2, data.d3, data.d4, data.d5, data.d6, data.d7, ...
+        toColSafe(data,8), toColSafe(data,9), ...
+        'VariableNames', {'t','E_cell','I_cell','SOC','phis_minus_phil','CC_flag','CV_flag','T_avg','T_max'});
+    % 충전구간만 저장
+    tbl = tbl(tbl.CC_flag==1 | tbl.CV_flag==1, :);
+    writetable(tbl, fn_csv);
+end
+
+function dump_timeseries_MSCC(model, Cvec, fn_csv)
+    model.param.set('first_MSCC_Crate',  num2str(Cvec(1)));
+    model.param.set('second_MSCC_Crate', num2str(Cvec(2)));
+    model.param.set('third_MSCC_Crate',  num2str(Cvec(3)));
+    model.param.set('fourth_MSCC_Crate', num2str(Cvec(4)));
+    model.study('std2').run();
+    expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil','liion.cdc1.CC_CH','liion.cdc1.CV_CH','T_avg','T_max'};
+    data = mpheval(model, expr, 'dataset','dset3','edim','point','selection',2,'solnum','all');
+    tbl = table(data.d1, data.d2, data.d3, data.d4, data.d5, data.d6, data.d7, ...
+        toColSafe(data,8), toColSafe(data,9), ...
+        'VariableNames', {'t','E_cell','I_cell','SOC','phis_minus_phil','CC_flag','CV_flag','T_avg','T_max'});
+    tbl = tbl(tbl.CC_flag==1 | tbl.CV_flag==1, :);
+    writetable(tbl, fn_csv);
+end
+
+function col = toColSafe(data, idx)
+    try, col = data.(['d' num2str(idx)]); catch, col = nan(size(data.d1)); end
+end
