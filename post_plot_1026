@@ -1,0 +1,770 @@
+
+% =========================================================================
+% Post-Plot for CCCV vs MSCC
+%  - 자동으로 최신 run_* 폴더 탐색 후 CSV 로드
+%  - 기존 Figure: 시간–전압/전류, 시간–과전압, SOC–과전압, 누적에너지, (온도)
+%  - 추가 Figure: Pareto, Convergence, Correlation, Feature Importance,
+%                 1D Marginal(PDP-like), 2D Response maps, Feasibility
+%  - 모든 그림은 화면에 표시 + figs/ 에 PNG로 저장
+% =========================================================================
+clc; clear; close all;
+
+%% 0) 경로 설정 & run_* 폴더 자동/수동 선택 (토글 가능)
+base_dir = 'G:\공유 드라이브\Battery Software Group (2025)\Members\최은식\COMSOL\MSCC_optimization\MSCC_CCCV_opt';
+assert(isfolder(base_dir), '기본 폴더 없음: %s', base_dir);
+
+% === 토글 스위치: true면 최신 run_* 자동선택, false면 대화형 선택 ===
+use_latest = false;
+
+if use_latest
+    % ----- 최신 run_* 폴더 자동 선택 -----
+    d = dir(fullfile(base_dir, 'run_*'));
+    assert(~isempty(d), 'run_* 폴더를 찾지 못했습니다. 먼저 최적화 스크립트를 실행해 CSV를 생성하세요.');
+    [~,ix] = max([d.datenum]);
+    run_dir = fullfile(base_dir, d(ix).name);
+else
+    % ----- 대화형 폴더 선택 -----
+    run_dir = uigetdir(base_dir, '분석할 run_* 폴더를 선택하세요');
+    if isstring(run_dir)
+        run_dir = char(run_dir);  % string → char 변환 (MATLAB R2023+ 대응)
+    end
+    assert(~isequal(run_dir, 0), '폴더 선택이 취소되었습니다.');
+    [~, sel_name] = fileparts(run_dir);
+    assert(startsWith(sel_name, 'run_'), '선택한 폴더명이 run_* 형식이 아닙니다: %s', sel_name);
+end
+
+% 하위 폴더/출력 폴더 세팅
+ts_dir  = fullfile(run_dir, 'timeseries');
+fig_dir = fullfile(run_dir, 'figs');
+if ~isfolder(fig_dir), mkdir(fig_dir); end
+
+% 로그 파일 경로
+cccv_log = pick_one_file(run_dir, 'cccv_optimization_log_*.csv');
+mscc_log = pick_one_file(run_dir, 'mscc_optimization_log_*.csv');
+
+fprintf('Using run dir: %s\n', run_dir);
+fprintf('  CCCV log: %s\n', cccv_log);
+fprintf('  MSCC  log: %s\n', mscc_log);
+
+
+
+% 색상
+blue  = [0, 115, 194]/255;   % CCCV
+red   = [205, 83,  76]/255;  % MSCC
+gray  = 0.75*[1 1 1];
+eps_s = 0.02;                % 안전 임계 (s ≤ eps면 위반)
+
+%% 1) 로그 로드
+TC = readtable(cccv_log);   % [C T s t80 cv_frac E_Wh Vdiff_min Vdiff_max]
+TM = readtable(mscc_log);   % [C1 C2 C3 C4 T s t80 cv_frac E_Wh Vdiff_min Vdiff_max]
+
+% 안전하게 변수명 체크
+reqC = {'C','T','s','t80','cv_frac','E_Wh','Vdiff_min','Vdiff_max'};
+reqM = {'C1','C2','C3','C4','T','s','t80','cv_frac','E_Wh','Vdiff_min','Vdiff_max'};
+assert(all(ismember(reqC, TC.Properties.VariableNames)), 'CCCV 로그 변수명이 예상과 다릅니다.');
+assert(all(ismember(reqM, TM.Properties.VariableNames)), 'MSCC  로그 변수명이 예상과 다릅니다.');
+
+C_cccv = TC.C;     T_cccv = TC.T;     s_cccv = TC.s;
+X_mscc = TM{:, {'C1','C2','C3','C4'}}; T_mscc = TM.T; s_mscc = TM.s;
+varNames = {'C1','C2','C3','C4'};
+
+%% 2) Pareto front (T vs s) ------------------------------------------------
+% 비지배해 판정: 최소화 F=[T, -s]
+mask_nd_C = isNondominated([T_cccv, -s_cccv]);
+mask_nd_M = isNondominated([T_mscc, -s_mscc]);
+
+[Tc_nd, ordC] = sort(T_cccv(mask_nd_C), 'ascend');
+sc_nd = s_cccv(mask_nd_C); sc_nd = sc_nd(ordC);
+
+[Tm_nd, ordM] = sort(T_mscc(mask_nd_M), 'ascend');
+sm_nd = s_mscc(mask_nd_M); sm_nd = sm_nd(ordM);
+
+f = figure(201); clf; hold on; grid on;
+scatter(T_cccv, s_cccv, 26, blue, 'filled', 'MarkerFaceAlpha',0.25, 'DisplayName','CCCV 샘플');
+scatter(T_mscc, s_mscc, 26, red , 'filled', 'MarkerFaceAlpha',0.25, 'DisplayName','MSCC 샘플');
+plot(Tc_nd, sc_nd, '-o', 'Color', blue,'LineWidth',1.8, 'DisplayName','CCCV Pareto');
+plot(Tm_nd, sm_nd, '-o', 'Color', red , 'LineWidth',1.8, 'DisplayName','MSCC Pareto');
+xlabel('충전시간 T (s)'); ylabel('안전여유 s = min(\phi_s-\phi_l) (V)');
+title('CCCV vs MSCC: Pareto front');
+legend('Location','best'); set(gca,'FontSize',11);
+export_png(f, fullfile(fig_dir,'pareto_T_vs_s.png'));
+
+%% 2') 3D Pareto (T vs s vs T_avg) -----------------------------------------
+hasTavgC = ismember('T_avg', TC.Properties.VariableNames);
+hasTavgM = ismember('T_avg', TM.Properties.VariableNames);
+
+if ~(hasTavgC && hasTavgM)
+    warning('로그에 T_avg 컬럼이 없어 3D 파레토는 건너뜁니다.');
+else
+    Tav_cccv = TC.T_avg;  Tav_mscc = TM.T_avg;
+
+    % 3목표 파레토(최소화: T, T_avg / 최대화: s → 최소화 -s)
+    mask_nd3_C = isNondominatedND([T_cccv, -s_cccv, Tav_cccv]);
+    mask_nd3_M = isNondominatedND([T_mscc, -s_mscc, Tav_mscc]);
+
+    f = figure(2013); clf; hold on; grid on; view(45,25);
+    % 전체 샘플
+    scatter3(T_cccv, s_cccv, Tav_cccv, 18, blue, 'filled', ...
+        'MarkerFaceAlpha',0.20, 'DisplayName','CCCV 샘플');
+    scatter3(T_mscc, s_mscc, Tav_mscc, 18, red , 'filled', ...
+        'MarkerFaceAlpha',0.20, 'DisplayName','MSCC 샘플');
+
+    % 파레토 점 강조
+    scatter3(T_cccv(mask_nd3_C), s_cccv(mask_nd3_C), Tav_cccv(mask_nd3_C), ...
+        48, blue, 'o', 'LineWidth',1.2, 'DisplayName','CCCV Pareto(3D)');
+    scatter3(T_mscc(mask_nd3_M), s_mscc(mask_nd3_M), Tav_mscc(mask_nd3_M), ...
+        48, red , 'o', 'LineWidth',1.2, 'DisplayName','MSCC Pareto(3D)');
+
+    xlabel('충전시간 T (s)');
+    ylabel('안전여유 s (V)  ↑');
+    zlabel('T_{avg} (K)');
+    title('CCCV vs MSCC: 3D Pareto (T, s, T_{avg})');
+    legend('Location','best');
+    set(gca,'FontSize',11);
+    export_png(f, fullfile(fig_dir,'pareto3D_T_s_Tavg.png'));
+end
+
+
+%% 3) Convergence (best-so-far T) -----------------------------------------
+f = figure(202); clf; tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+nexttile;
+plot(cummin(T_cccv), '-','LineWidth',1.5,'Color',blue); grid on;
+xlabel('평가 #'); ylabel('best-so-far T (s)'); title('CCCV 수렴(로그 순서)');
+
+nexttile;
+plot(cummin(T_mscc), '-','LineWidth',1.5,'Color',red); grid on;
+xlabel('평가 #'); ylabel('best-so-far T (s)'); title('MSCC 수렴(로그 순서)');
+export_png(f, fullfile(fig_dir,'convergence_best_T.png'));
+
+%% 4) Correlation heatmaps (MSCC만) ----------------------------------------
+labels = [varNames, {'T','s'}];
+R_p = corr([X_mscc T_mscc s_mscc], 'Type','Pearson','Rows','pairwise');
+R_s = corr([X_mscc T_mscc s_mscc], 'Type','Spearman','Rows','pairwise');
+
+f = figure(203); clf; tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+nexttile; imagesc(R_p); axis image; colorbar; caxis([-1 1]);
+set(gca,'XTick',1:numel(labels),'XTickLabel',labels,'XTickLabelRotation',45,...
+        'YTick',1:numel(labels),'YTickLabel',labels);
+title('MSCC 상관(Pearson)'); 
+nexttile; imagesc(R_s); axis image; colorbar; caxis([-1 1]);
+set(gca,'XTick',1:numel(labels),'XTickLabel',labels,'XTickLabelRotation',45,...
+        'YTick',1:numel(labels),'YTickLabel',labels);
+title('MSCC 상관(Spearman)');
+export_png(f, fullfile(fig_dir,'mscc_correlation_heatmaps.png'));
+
+%% 5) Feature importance (RandomForest, T & s) -----------------------------
+hasML = (exist('TreeBagger','file') == 2);
+if hasML
+    rng(42);
+    try
+        M_T = TreeBagger(200, X_mscc, T_mscc, 'Method','regression', ...
+            'OOBPrediction','on','OOBPredictorImportance','on');
+        impT = M_T.OOBPermutedPredictorDeltaError(:);
+
+        M_s = TreeBagger(200, X_mscc, s_mscc, 'Method','regression', ...
+            'OOBPrediction','on','OOBPredictorImportance','on');
+        impS = M_s.OOBPermutedPredictorDeltaError(:);
+
+        f = figure(204); clf; tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+        nexttile; bar(impT,'FaceColor',red); grid on;
+        set(gca,'XTick',1:4,'XTickLabel',varNames); ylabel('\DeltaOOB Error'); title('중요도→T');
+        nexttile; bar(impS,'FaceColor',red); grid on;
+        set(gca,'XTick',1:4,'XTickLabel',varNames); ylabel('\DeltaOOB Error'); title('중요도→s');
+        export_png(f, fullfile(fig_dir,'mscc_feature_importance.png'));
+    catch ME
+        warning('TreeBagger 실행 실패: %s. 간이 대체(표준화 회귀) 진행.', ME.message);
+        plot_lr_importance(X_mscc,T_mscc,s_mscc,varNames,fig_dir);
+    end
+else
+    warning('TreeBagger 미탑재: 간이 대체(표준화 회귀) 진행.');
+    plot_lr_importance(X_mscc,T_mscc,s_mscc,varNames,fig_dir);
+end
+
+%% 6) 1D marginal (binned median) ------------------------------------------
+nbins = 12;
+f = figure(205); clf; tiledlayout(2,4,'Padding','compact','TileSpacing','compact');
+for i=1:4
+    xi = X_mscc(:,i);
+    [centers, medT] = binned_median(xi, T_mscc, nbins);
+    [~, medS]      = binned_median(xi, s_mscc, nbins);
+
+    nexttile(i);
+    plot(centers, medT, '-o','Color',red,'LineWidth',1.5,'MarkerSize',4); grid on;
+    xlabel(varNames{i}); ylabel('median T (s)'); title(sprintf('Ci→T (%s)',varNames{i}));
+
+    nexttile(i+4);
+    plot(centers, medS, '-o','Color',red,'LineWidth',1.5,'MarkerSize',4); grid on;
+    yline(eps_s,'--k','\epsilon','HandleVisibility','off');
+    xlabel(varNames{i}); ylabel('median s (V)'); title(sprintf('Ci→s (%s)',varNames{i}));
+end
+export_png(f, fullfile(fig_dir,'mscc_1D_marginals.png'));
+
+%% 7) 2D response maps (Ci,Cj) → median T/s --------------------------------
+pairs = nchoosek(1:4,2);
+nbx = 12; nby = 12;
+f = figure(206); clf; tiledlayout(size(pairs,1),2,'Padding','compact','TileSpacing','compact');
+for k=1:size(pairs,1)
+    i = pairs(k,1); j = pairs(k,2);
+    xi = X_mscc(:,i); xj = X_mscc(:,j);
+    [Xc, Yc, ZT] = binned_2d_median(xi, xj, T_mscc, nbx, nby);
+    [~,  ~,  ZS] = binned_2d_median(xi, xj, s_mscc, nbx, nby);
+
+    nexttile; imagesc(Xc, Yc, ZT); axis xy; colorbar;
+    xlabel(varNames{j}); ylabel(varNames{i});
+    title(sprintf('median T: (%s,%s)', varNames{i}, varNames{j}));
+
+    nexttile; imagesc(Xc, Yc, ZS); axis xy; colorbar;
+    xlabel(varNames{j}); ylabel(varNames{i});
+    title(sprintf('median s: (%s,%s)', varNames{i}, varNames{j}));
+end
+export_png(f, fullfile(fig_dir,'mscc_2D_response_maps.png'));
+
+%% 8) Feasibility vs Ci (s ≤ eps 비율) -------------------------------------
+f = figure(207); clf; tiledlayout(1,4,'Padding','compact','TileSpacing','compact');
+for i=1:4
+    xi = X_mscc(:,i);
+    [centers, rate] = binned_rate(xi, s_mscc <= eps_s, nbins);
+    nexttile;
+    plot(centers, rate, '-o','Color',red,'LineWidth',1.5,'MarkerSize',4); grid on;
+    ylim([0 1]); xlabel(varNames{i}); ylabel('위반비율 (s ≤ ε)', 'Interpreter','none');
+    title(sprintf('Feasibility (%s)', varNames{i}));
+end
+export_png(f, fullfile(fig_dir,'mscc_feasibility.png'));
+
+%% 8.5) Search-space 3D scatter (CSV 기반, 조합별 시각화) -------------------
+% 성공/실패 정의: s > eps_s ⇒ 성공, s ≤ eps_s ⇒ 실패
+succ = TM.s > eps_s & isfinite(TM.T);
+fail = TM.s <= eps_s | ~isfinite(TM.T);
+
+combos = {
+    {'C1','C2','C3'}, 208;
+    {'C1','C2','C4'}, 209;
+    {'C1','C3','C4'}, 210;
+    {'C2','C3','C4'}, 211;
+};
+
+for k = 1:size(combos,1)
+    cols = combos{k,1}; fnum = combos{k,2};
+    Xi = TM.(cols{1}); Xj = TM.(cols{2}); Xk = TM.(cols{3});
+
+    f = figure(fnum); clf; hold on; grid on; view(3);
+    if any(fail)
+        scatter3(Xi(fail), Xj(fail), Xk(fail), 30, [0.7 0 0], 'x', 'DisplayName','실패(s\le\epsilon)');
+    end
+    if any(succ)
+        scatter3(Xi(succ), Xj(succ), Xk(succ), 40, [0 0.45 0.74], 'o', 'filled', 'DisplayName','성공(s>\epsilon)');
+    end
+
+    % (선택) Pareto 근접 점 강조: 상위 10% 빠른 시간 & s>eps
+    qT = quantile(TM.T(succ), 0.10);
+    nearPareto = succ & TM.T <= qT;
+    if any(nearPareto)
+        scatter3(Xi(nearPareto), Xj(nearPareto), Xk(nearPareto), 70, 'k', '*', 'DisplayName','빠른 상위10%');
+    end
+
+    xlabel(cols{1}); ylabel(cols{2}); zlabel(cols{3});
+    title(sprintf('탐색공간: (%s, %s, %s)', cols{1}, cols{2}, cols{3}));
+    legend('Location','best');
+    export_png(f, fullfile(fig_dir, sprintf('space3d_%s_%s_%s.png', cols{1}, cols{2}, cols{3})));
+end
+
+%% 8.6) CV fraction diagnostics (csv: cv_frac) ------------------------------
+% 산점도: cv_frac vs T, cv_frac vs s  + 분포
+f = figure(212); clf; tiledlayout(1,3,'Padding','compact','TileSpacing','compact');
+
+% (a) cv_frac vs T
+nexttile; hold on; grid on;
+scatter(TM.cv_frac, TM.T, 18, red, 'filled', 'MarkerFaceAlpha',0.35);
+xlabel('cv\_frac'); ylabel('T (s)'); title('MSCC: cv\_frac vs T');
+
+% (b) cv_frac vs s
+nexttile; hold on; grid on;
+scatter(TM.cv_frac, TM.s, 18, red, 'filled', 'MarkerFaceAlpha',0.35);
+yline(eps_s,'--k','\epsilon','HandleVisibility','off');
+xlabel('cv\_frac'); ylabel('s (V)'); title('MSCC: cv\_frac vs s');
+
+% (c) 분포
+nexttile; hold on; grid on;
+histogram(TM.cv_frac, 'FaceColor', red, 'FaceAlpha',0.4);
+xlabel('cv\_frac'); ylabel('count'); title('MSCC: cv\_frac 분포');
+
+export_png(f, fullfile(fig_dir,'mscc_cvfrac_diagnostics.png'));
+
+%% 8.7) t80 vs T & t80 분포 -----------------------------------------------
+f = figure(213); clf; tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+
+% (a) t80 vs T
+nexttile; hold on; grid on;
+scatter(TM.t80, TM.T, 18, red, 'filled', 'MarkerFaceAlpha',0.35);
+plot([min(TM.t80) max(TM.t80)], [min(TM.t80) max(TM.t80)], '--k','LineWidth',1); % y=x 참고선
+xlabel('t80 (s)'); ylabel('T (s)'); title('MSCC: t80 vs T (y=x reference)');
+
+% (b) t80 분포
+nexttile; hold on; grid on;
+histogram(TM.t80, 'FaceColor', red, 'FaceAlpha',0.4);
+xlabel('t80 (s)'); ylabel('count'); title('MSCC: t80 분포');
+
+export_png(f, fullfile(fig_dir,'mscc_t80_analysis.png'));
+
+%% 8.8) Energy-in vs Speed (E_Wh vs T, colored by s) -----------------------
+f = figure(214); clf; hold on; grid on;
+sz = 26;
+sc = scatter(TM.T, TM.E_Wh, sz, TM.s, 'filled', 'MarkerFaceAlpha',0.5);
+xlabel('T (s)'); ylabel('E_{in} (Wh)'); title('MSCC: E_{in} vs T (colored by s)');
+cb = colorbar; cb.Label.String = 's (V)';
+export_png(f, fullfile(fig_dir,'mscc_energy_vs_time_colored_by_s.png'));
+
+
+%% 8.9) Distribution overview (T, s, Vdiff, C_i) ---------------------------
+f = figure(215); clf; tiledlayout(2,4,'Padding','compact','TileSpacing','compact');
+
+% (a) T, (b) s, (c) Vdiff_min, (d) Vdiff_max
+nexttile; histogram(TM.T,       'FaceColor', red, 'FaceAlpha',0.45); grid on; title('T (s)');       xlabel('T');
+nexttile; histogram(TM.s,       'FaceColor', red, 'FaceAlpha',0.45); grid on; title('s (V)');       xlabel('s');
+nexttile; histogram(TM.Vdiff_min,'FaceColor', red, 'FaceAlpha',0.45); grid on; title('Vdiff_{min}');xlabel('V (min)');
+nexttile; histogram(TM.Vdiff_max,'FaceColor', red, 'FaceAlpha',0.45); grid on; title('Vdiff_{max}');xlabel('V (max)');
+
+% (e-h) C1..C4
+for i=1:4
+    nexttile; histogram(X_mscc(:,i),'FaceColor', red, 'FaceAlpha',0.45); grid on;
+    title(sprintf('C%d 분포', i)); xlabel(sprintf('C%d (C-rate)',i));
+end
+export_png(f, fullfile(fig_dir,'mscc_distribution_overview.png'));
+
+%% 8.10) Parallel coordinates (CSV-based) ----------------------------------
+Z = [X_mscc, TM.T, TM.s];
+Z = (Z - nanmean(Z,1)) ./ nanstd(Z,0,1);
+ok = all(isfinite(Z),2);
+Z = Z(ok,:);
+succOK = TM.s(ok) > eps_s;
+
+labels = [varNames, {'T','s'}];
+f = figure(216); clf; hold on; grid on;
+
+% 1) 먼저 기본 플롯 (색 지정 없이)
+h = parallelcoords(Z, ...
+    'Labels',   labels, ...
+    'Group',    succOK, ...
+    'Quantile', 0.5, ...
+    'LineWidth',0.8);
+
+% 2) 그룹별 색상 사후 적용 (false=1, true=2)
+gcolors = [0.70 0.10 0.10;  % 실패(붉은)
+           0.10 0.40 0.80]; % 성공(파란)
+succOK = succOK(:);
+for i = 1:numel(h)
+    gi = double(succOK(i)) + 1;      % false->1, true->2
+    if gi<1 || gi>2 || ~isfinite(gi), gi = 1; end
+    set(h(i), 'Color', gcolors(gi,:));
+end
+
+title('MSCC Parallel Coordinates (CSV, succ= s>\epsilon)');
+export_png(f, fullfile(fig_dir,'mscc_parallelcoords_csv.png'));
+
+
+
+%% 9) 기존 Figure (대표 시계열 CSV 기반) -----------------------------------
+% timeseries 디렉토리에 다음 파일들을 자동 검색 후 그려줌:
+%   CCCV_fast/safe/knee.csv, MSCC_fast/safe/knee.csv
+series = dir(fullfile(ts_dir, '*.csv'));
+if isempty(series)
+    warning('대표 시계열 CSV를 찾지 못했습니다: %s', ts_dir);
+else
+    % 그룹별로 읽기
+    S = struct('name',{},'tbl',{},'color',{});
+    for k=1:numel(series)
+        fp = fullfile(series(k).folder, series(k).name);
+        TBL = readtable(fp);
+        S(end+1).name = series(k).name; %#ok<SAGROW>
+        S(end).tbl    = TBL;
+        if startsWith(lower(series(k).name),'cccv')
+            S(end).color = blue;
+        else
+            S(end).color = red;
+        end
+    end
+
+    % (a) 시간–전압/전류 (yyaxis)
+    f = figure(301); clf; hold on; grid on;
+    for k=1:numel(S)
+        t=S(k).tbl.t; V=S(k).tbl.E_cell; I=S(k).tbl.I_cell;
+        yyaxis left;  plot(t,V,'-','LineWidth',1.3,'Color',S(k).color);
+        yyaxis right; plot(t,I,'--','LineWidth',1.1,'Color',S(k).color);
+    end
+    yyaxis left;  ylabel('V (V)');
+    yyaxis right; ylabel('I (A)');
+    xlabel('t (s)'); title('시간–전압/전류 (대표 시계열)');
+    export_png(f, fullfile(fig_dir,'timeseries_VI.png'));
+
+    % (b) SOC–과전압
+    f = figure(302); clf; hold on; grid on;
+    for k=1:numel(S)
+        plot(S(k).tbl.SOC, S(k).tbl.phis_minus_phil, 'LineWidth',1.3,'Color',S(k).color);
+    end
+    xlabel('SOC'); ylabel('\phi_s-\phi_l (V)'); title('SOC–과전압 (대표 시계열)');
+    export_png(f, fullfile(fig_dir,'timeseries_SOC_overpot.png'));
+
+    % (c) 시간–과전압
+    f = figure(303); clf; hold on; grid on;
+    for k=1:numel(S)
+        plot(S(k).tbl.t, S(k).tbl.phis_minus_phil, 'LineWidth',1.3,'Color',S(k).color);
+    end
+    xlabel('t (s)'); ylabel('\phi_s-\phi_l (V)'); title('시간–과전압 (대표 시계열)');
+    export_png(f, fullfile(fig_dir,'timeseries_t_overpot.png'));
+
+    % (d) 누적 에너지
+    f = figure(304); clf; hold on; grid on;
+    for k=1:numel(S)
+        t=S(k).tbl.t; V=S(k).tbl.E_cell; I=S(k).tbl.I_cell;
+        E = cumtrapz(t, V.*I)/3600; % Wh
+        plot(t, E, 'LineWidth',1.3,'Color',S(k).color);
+    end
+    xlabel('t (s)'); ylabel('누적 에너지 (Wh)'); title('누적 에너지 (대표 시계열)');
+    export_png(f, fullfile(fig_dir,'timeseries_cum_energy.png'));
+
+    % (e) 온도 (있으면)
+    hasT = any( ismember({'T_avg','T_max'}, S(1).tbl.Properties.VariableNames) );
+    if hasT
+        % 평균온도
+        f = figure(305); clf; hold on; grid on;
+        for k=1:numel(S)
+            if ismember('T_avg', S(k).tbl.Properties.VariableNames)
+                plot(S(k).tbl.t, S(k).tbl.T_avg, 'LineWidth',1.3,'Color',S(k).color);
+            end
+        end
+        xlabel('t (s)'); ylabel('T_{avg} (K)'); title('평균 온도 (대표 시계열)'); 
+        export_png(f, fullfile(fig_dir,'timeseries_Tavg.png'));
+
+        % 최고온도
+        f = figure(306); clf; hold on; grid on;
+        for k=1:numel(S)
+            if ismember('T_max', S(k).tbl.Properties.VariableNames)
+                plot(S(k).tbl.t, S(k).tbl.T_max, 'LineWidth',1.3,'Color',S(k).color);
+            end
+        end
+        xlabel('t (s)'); ylabel('T_{max} (K)'); title('최고 온도 (대표 시계열)'); 
+        export_png(f, fullfile(fig_dir,'timeseries_Tmax.png'));
+    end
+end
+%% 8.opt) OPT-only 시계열 (최적화된 파라미터로 생성된 *_opt.csv 사용) ------
+opt_cccv = fullfile(ts_dir, 'CCCV_opt.csv');
+opt_mscc = fullfile(ts_dir, 'MSCC_opt.csv');
+
+hasOptC = isfile(opt_cccv);
+hasOptM = isfile(opt_mscc);
+
+if ~(hasOptC || hasOptM)
+    warning('OPT 시계열 CSV가 없습니다. (CCCV_opt.csv / MSCC_opt.csv)');
+else
+    So = struct('name',{},'tbl',{},'color',{});
+    if hasOptC
+        ToC = readtable(opt_cccv);
+        So(end+1).name = 'CCCV_opt'; %#ok<SAGROW>
+        So(end).tbl    = ToC;
+        So(end).color  = blue;
+    end
+    if hasOptM
+        ToM = readtable(opt_mscc);
+        So(end+1).name = 'MSCC_opt'; %#ok<SAGROW>
+        So(end).tbl    = ToM;
+        So(end).color  = red;
+    end
+
+    % (1) 시간–전압/전류
+    f = figure(310); clf; hold on; grid on;
+    for k=1:numel(So)
+        t=So(k).tbl.t; V=So(k).tbl.E_cell; I=So(k).tbl.I_cell;
+        yyaxis left;  plot(t,V,'-','LineWidth',1.8,'Color',So(k).color,'DisplayName',[So(k).name ' V']);
+        yyaxis right; plot(t,I,'--','LineWidth',1.4,'Color',So(k).color,'DisplayName',[So(k).name ' I']);
+    end
+    yyaxis left;  ylabel('V (V)');
+    yyaxis right; ylabel('I (A)');
+    xlabel('t (s)'); title('OPT-only: Time–Voltage/Current');
+    legend('Location','best'); export_png(f, fullfile(fig_dir,'opt_time_VI.png'));
+
+    % (2) SOC–과전압
+    f = figure(311); clf; hold on; grid on;
+    for k=1:numel(So)
+        plot(So(k).tbl.SOC, So(k).tbl.phis_minus_phil, 'LineWidth',1.8,'Color',So(k).color, 'DisplayName', So(k).name);
+    end
+    xlabel('SOC'); ylabel('\phi_s-\phi_l (V)'); title('OPT-only: SOC–Overpotential');
+    legend('Location','best'); export_png(f, fullfile(fig_dir,'opt_SOC_overpot.png'));
+
+    % (3) 시간–과전압
+    f = figure(312); clf; hold on; grid on;
+    for k=1:numel(So)
+        plot(So(k).tbl.t, So(k).tbl.phis_minus_phil, 'LineWidth',1.8,'Color',So(k).color, 'DisplayName', So(k).name);
+    end
+    xlabel('t (s)'); ylabel('\phi_s-\phi_l (V)'); title('OPT-only: Time–Overpotential');
+    legend('Location','best'); export_png(f, fullfile(fig_dir,'opt_time_overpot.png'));
+
+    % (4) 누적 에너지
+    f = figure(313); clf; hold on; grid on;
+    for k=1:numel(So)
+        t=So(k).tbl.t; V=So(k).tbl.E_cell; I=So(k).tbl.I_cell;
+        E = cumtrapz(t, V.*I)/3600;
+        plot(t, E, 'LineWidth',1.8,'Color',So(k).color,'DisplayName',So(k).name);
+    end
+    xlabel('t (s)'); ylabel('E (Wh)'); title('OPT-only: Cumulative Energy');
+    legend('Location','best'); export_png(f, fullfile(fig_dir,'opt_cum_energy.png'));
+
+    % (5) 온도(있으면)
+    hasTavg = any(strcmpi('T_avg', So(1).tbl.Properties.VariableNames));
+    hasTmax = any(strcmpi('T_max', So(1).tbl.Properties.VariableNames));
+    if hasTavg
+        f = figure(314); clf; hold on; grid on;
+        for k=1:numel(So)
+            if ismember('T_avg', So(k).tbl.Properties.VariableNames)
+                plot(So(k).tbl.t, So(k).tbl.T_avg, 'LineWidth',1.6,'Color',So(k).color, 'DisplayName', So(k).name);
+            end
+        end
+        xlabel('t (s)'); ylabel('T_{avg} (K)'); title('OPT-only: Average Temperature');
+        legend('Location','best'); export_png(f, fullfile(fig_dir,'opt_Tavg.png'));
+    end
+    if hasTmax
+        f = figure(315); clf; hold on; grid on;
+        for k=1:numel(So)
+            if ismember('T_max', So(k).tbl.Properties.VariableNames)
+                plot(So(k).tbl.t, So(k).tbl.T_max, 'LineWidth',1.6,'Color',So(k).color, 'DisplayName', So(k).name);
+            end
+        end
+        xlabel('t (s)'); ylabel('T_{max} (K)'); title('OPT-only: Max Temperature');
+        legend('Location','best'); export_png(f, fullfile(fig_dir,'opt_Tmax.png'));
+    end
+end
+
+
+% %% 10) FAST-only 비교 (CCCV_fast vs MSCC_fast [+ Pulse_fast])
+% % timeseries/ 안의 *_fast.csv만 사용해서 비교
+% try
+%     fast_fig_dir = fullfile(fig_dir, 'fast_only');
+%     if ~isfolder(fast_fig_dir), mkdir(fast_fig_dir); end
+% 
+%     % --- 가장 최신 CCCV_fast, MSCC_fast 선택
+%     Lc = dir(fullfile(ts_dir,'CCCV_*fast*.csv'));  assert(~isempty(Lc),'CCCV_fast CSV 없음');
+%     [~,ix] = max([Lc.datenum]); f_cccv = fullfile(Lc(ix).folder, Lc(ix).name);
+% 
+%     Lm = dir(fullfile(ts_dir,'MSCC_*fast*.csv'));  assert(~isempty(Lm),'MSCC_fast CSV 없음');
+%     [~,ix] = max([Lm.datenum]); f_mscc = fullfile(Lm(ix).folder, Lm(ix).name);
+% 
+%     % --- Pulse_fast 있으면 선택(없어도 진행)
+%     Lp = [ dir(fullfile(ts_dir,'*pulse*fast*.csv')); ...
+%            dir(fullfile(ts_dir,'*Pulse*fast*.csv')); ...
+%            dir(fullfile(ts_dir,'MSCC+Pulse_*fast*.csv')) ];
+%     hasPulse = ~isempty(Lp);
+%     if hasPulse
+%         [~,ix] = max([Lp.datenum]); f_pulse = fullfile(Lp(ix).folder, Lp(ix).name);
+%     end
+% 
+%     % --- 로드
+%     Tcc = readtable(f_cccv);
+%     Tms = readtable(f_mscc);
+%     if hasPulse, Tpl = readtable(f_pulse); end
+% 
+%     % --- 색상 (위에서 정의한 blue/red 그대로 사용, pulse만 추가)
+%     pulse_col = [0, 158, 115]/255;
+% 
+%     % ========== (1) 시간–전압/전류 ==========
+%     f = figure(401); clf; hold on; grid on; set(gcf,'Color','w');
+%     yyaxis left
+%     plot(Tcc.t, Tcc.E_cell,'-','LineWidth',1.5,'Color',blue);
+%     plot(Tms.t, Tms.E_cell,'-','LineWidth',1.5,'Color',red);
+%     if hasPulse, plot(Tpl.t, Tpl.E_cell,'-','LineWidth',1.5,'Color',pulse_col); end
+%     ylabel('Voltage (V)');
+% 
+%     yyaxis right
+%     plot(Tcc.t, Tcc.I_cell,'--','LineWidth',1.3,'Color',blue);
+%     plot(Tms.t, Tms.I_cell,'--','LineWidth',1.3,'Color',red);
+%     if hasPulse, plot(Tpl.t, Tpl.I_cell,'--','LineWidth',1.3,'Color',pulse_col); end
+%     ylabel('Current (A)');
+% 
+%     xlabel('Time (s)'); title('FAST only: Time–Voltage/Current');
+%     if hasPulse
+%         legend({'CCCV(V)','MSCC(V)','MSCC+Pulse(V)','CCCV(I)','MSCC(I)','MSCC+Pulse(I)'},'Location','best');
+%     else
+%         legend({'CCCV(V)','MSCC(V)','CCCV(I)','MSCC(I)'},'Location','best');
+%     end
+%     export_png(f, fullfile(fast_fig_dir,'fast_time_VI.png'));
+% 
+%     % ========== (2) SOC–과전압 ==========
+%     f = figure(402); clf; hold on; grid on; set(gcf,'Color','w');
+%     plot(Tcc.SOC, Tcc.phis_minus_phil,'LineWidth',1.5,'Color',blue);
+%     plot(Tms.SOC, Tms.phis_minus_phil,'LineWidth',1.5,'Color',red);
+%     if hasPulse, plot(Tpl.SOC, Tpl.phis_minus_phil,'LineWidth',1.5,'Color',pulse_col); end
+%     xlabel('SOC'); ylabel('\phi_s - \phi_l (V)');
+%     title('FAST only: SOC–Overpotential');
+%     if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
+%     else,        legend({'CCCV','MSCC'},'Location','best'); end
+%     export_png(f, fullfile(fast_fig_dir,'fast_SOC_overpot.png'));
+% 
+%     % ========== (3) 시간–과전압 ==========
+%     f = figure(403); clf; hold on; grid on; set(gcf,'Color','w');
+%     plot(Tcc.t, Tcc.phis_minus_phil,'LineWidth',1.5,'Color',blue);
+%     plot(Tms.t, Tms.phis_minus_phil,'LineWidth',1.5,'Color',red);
+%     if hasPulse, plot(Tpl.t, Tpl.phis_minus_phil,'LineWidth',1.5,'Color',pulse_col); end
+%     xlabel('Time (s)'); ylabel('\phi_s - \phi_l (V)');
+%     title('FAST only: Time–Overpotential');
+%     if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
+%     else,        legend({'CCCV','MSCC'},'Location','best'); end
+%     export_png(f, fullfile(fast_fig_dir,'fast_time_overpot.png'));
+% 
+%     % ========== (4) 누적 에너지 (Wh) ==========
+%     Ecc = cumtrapz(Tcc.t, Tcc.E_cell .* Tcc.I_cell)/3600;
+%     Ems = cumtrapz(Tms.t, Tms.E_cell .* Tms.I_cell)/3600;
+%     if hasPulse, Epl = cumtrapz(Tpl.t, Tpl.E_cell .* Tpl.I_cell)/3600; end
+% 
+%     f = figure(404); clf; hold on; grid on; set(gcf,'Color','w');
+%     plot(Tcc.t, Ecc,'LineWidth',1.5,'Color',blue);
+%     plot(Tms.t, Ems,'LineWidth',1.5,'Color',red);
+%     if hasPulse, plot(Tpl.t, Epl,'LineWidth',1.5,'Color',pulse_col); end
+%     xlabel('Time (s)'); ylabel('Cumulative Energy (Wh)');
+%     title('FAST only: Cumulative Energy');
+%     if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
+%     else,        legend({'CCCV','MSCC'},'Location','best'); end
+%     export_png(f, fullfile(fast_fig_dir,'fast_cum_energy.png'));
+% 
+%     % ========== (5) 온도 (있으면) ==========
+%     hasTavg = ismember('T_avg', Tcc.Properties.VariableNames) || ...
+%               ismember('T_avg', Tms.Properties.VariableNames) || ...
+%               (hasPulse && ismember('T_avg', Tpl.Properties.VariableNames));
+%     if hasTavg
+%         f = figure(405); clf; hold on; grid on; set(gcf,'Color','w');
+%         if ismember('T_avg', Tcc.Properties.VariableNames), plot(Tcc.t, Tcc.T_avg,'LineWidth',1.4,'Color',blue); end
+%         if ismember('T_avg', Tms.Properties.VariableNames), plot(Tms.t, Tms.T_avg,'LineWidth',1.4,'Color',red); end
+%         if hasPulse && ismember('T_avg', Tpl.Properties.VariableNames), plot(Tpl.t, Tpl.T_avg,'LineWidth',1.4,'Color',pulse_col); end
+%         xlabel('Time (s)'); ylabel('T_{avg} (K)'); title('FAST only: Average Temperature');
+%         if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
+%         else,        legend({'CCCV','MSCC'},'Location','best'); end
+%         export_png(f, fullfile(fast_fig_dir,'fast_Tavg.png'));
+%     end
+% 
+%     hasTmax = ismember('T_max', Tcc.Properties.VariableNames) || ...
+%               ismember('T_max', Tms.Properties.VariableNames) || ...
+%               (hasPulse && ismember('T_max', Tpl.Properties.VariableNames));
+%     if hasTmax
+%         f = figure(406); clf; hold on; grid on; set(gcf,'Color','w');
+%         if ismember('T_max', Tcc.Properties.VariableNames), plot(Tcc.t, Tcc.T_max,'LineWidth',1.4,'Color',blue); end
+%         if ismember('T_max', Tms.Properties.VariableNames), plot(Tms.t, Tms.T_max,'LineWidth',1.4,'Color',red); end
+%         if hasPulse && ismember('T_max', Tpl.Properties.VariableNames), plot(Tpl.t, Tpl.T_max,'LineWidth',1.4,'Color',pulse_col); end
+%         xlabel('Time (s)'); ylabel('T_{max} (K)'); title('FAST only: Max Temperature');
+%         if hasPulse, legend({'CCCV','MSCC','MSCC+Pulse'},'Location','best');
+%         else,        legend({'CCCV','MSCC'},'Location','best'); end
+%         export_png(f, fullfile(fast_fig_dir,'fast_Tmax.png'));
+%     end
+% 
+%     fprintf('완료: %s 에 FAST-only 비교 PNG 저장됨.\n', fast_fig_dir);
+% 
+% catch ME
+%     warning('FAST-only 비교 섹션 오류: %s', ME.message);
+% end
+
+disp('완료: figs/ 폴더에 모든 PNG가 저장되었습니다.');
+
+%% ======================= Local helper functions ==========================
+function fpath = pick_one_file(folder, pattern)
+    L = dir(fullfile(folder, pattern));
+    assert(~isempty(L), '파일이 없습니다: %s', fullfile(folder, pattern));
+    % 가장 최근 파일 선택
+    [~,ix] = max([L.datenum]);
+    fpath = fullfile(L(ix).folder, L(ix).name);
+end
+
+function export_png(fig_handle, outpath)
+    try
+        set(fig_handle, 'Color','w');
+        % 축 툴바 숨김
+        axs = findall(fig_handle, 'Type', 'axes');
+        for ax = axs'
+            try, axtoolbar(ax,'Visible','off'); end %#ok<TRYNC>
+        end
+        exportgraphics(fig_handle, outpath, 'Resolution', 200);
+    catch
+        warning('PNG 저장 실패: %s', outpath);
+    end
+end
+
+function mask_nd = isNondominated(F)
+% F: [N x M], M=2 (열1=T(작을수록), 열2=-s(작을수록))
+% 반환: 비지배(true)/지배(false)
+    N = size(F,1);
+    mask_nd = true(N,1);
+    for i=1:N
+        if ~mask_nd(i), continue; end
+        for j=1:N
+            if i==j, continue; end
+            if all(F(j,:) <= F(i,:)) && any(F(j,:) < F(i,:))
+                mask_nd(i) = false; break;
+            end
+        end
+    end
+end
+
+function [centers, medY] = binned_median(x, y, nbins)
+    edges   = linspace(min(x), max(x), nbins+1);
+    centers = movmean(edges,2,'Endpoints','discard');
+    [~,bin] = histc(x, edges);
+    medY    = nan(nbins,1);
+    for b=1:nbins
+        idx = (bin==b);
+        if any(idx), medY(b) = median(y(idx)); end
+    end
+end
+
+function [centersX, centersY, Z] = binned_2d_median(x, y, z, nx, ny)
+    ex = linspace(min(x), max(x), nx+1);
+    ey = linspace(min(y), max(y), ny+1);
+    centersX = movmean(ex,2,'Endpoints','discard');
+    centersY = movmean(ey,2,'Endpoints','discard');
+    Z = nan(nx, ny);
+    for i=1:nx
+        for j=1:ny
+            idx = x>=ex(i) & x<ex(i+1) & y>=ey(j) & y<ey(j+1);
+            if any(idx), Z(i,j) = median(z(idx)); end
+        end
+    end
+end
+
+function [centers, rate] = binned_rate(x, flag, nbins)
+    edges   = linspace(min(x), max(x), nbins+1);
+    centers = movmean(edges,2,'Endpoints','discard');
+    [~,bin] = histc(x, edges);
+    rate    = nan(nbins,1);
+    for b=1:nbins
+        idx = (bin==b);
+        if any(idx), rate(b) = mean(flag(idx)); end
+    end
+end
+
+function plot_lr_importance(X, T_mscc, s_mscc, varNames, fig_dir)
+% TreeBagger가 없을 때 대체: 표준화 후 선형회귀 계수 절댓값으로 중요도 근사
+    Xz = (X - mean(X,1)) ./ std(X,0,1);
+    Xz(:, any(~isfinite(Xz))) = 0;
+
+    bT = Xz \ T_mscc;
+    bs = Xz \ s_mscc;
+    impT = abs(bT(:)); impS = abs(bs(:));
+
+    f = figure(204); clf; tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+    nexttile; bar(impT,'FaceColor',[.6 .2 .2]); grid on;
+    set(gca,'XTick',1:4,'XTickLabel',varNames); ylabel('|coef|'); title('대체 중요도→T');
+    nexttile; bar(impS,'FaceColor',[.6 .2 .2]); grid on;
+    set(gca,'XTick',1:4,'XTickLabel',varNames); ylabel('|coef|'); title('대체 중요도→s');
+    export_png(f, fullfile(fig_dir,'mscc_feature_importance_linear.png'));
+end
+
+function mask_nd = isNondominatedND(F)
+% F: [N x M], 각 열은 "최소화" 대상. (여기서는 s는 부호를 바꿔 -s로 넣음)
+    N = size(F,1);
+    mask_nd = true(N,1);
+    for i = 1:N
+        if ~mask_nd(i), continue; end
+        for j = 1:N
+            if i==j, continue; end
+            % j가 i를 (모든 목표에 대해 <= 이고, 적어도 하나는 <)로 지배하면 i는 비지배 아님
+            if all(F(j,:) <= F(i,:)) && any(F(j,:) < F(i,:))
+                mask_nd(i) = false;
+                break;
+            end
+        end
+    end
+end
