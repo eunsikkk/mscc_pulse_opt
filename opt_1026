@@ -1,5 +1,5 @@
 % =========================================================================
-% COMSOL-MATLAB: One-Run Optimization → All CSVs for Post Figures
+% COMSOL-MATLAB: One-Run Optimization → All CSVs for Post Figures (Robust)
 %   - Protocols: CCCV (std1,dset1, param 'C_rate')
 %                MSCC (std2,dset3, params 'first_MSCC_Crate'..'fourth_MSCC_Crate')
 %   - Trial Log CSVs (각 평가시도 요약): 
@@ -34,7 +34,7 @@ fn_mscc = fullfile(out_dir, ['mscc_optimization_log_' ts '.csv']);
 
 % 안전 임계 및 surrogateopt 평가 횟수
 safety_eps = 0.02;     % [V]
-N_EVALS    = 500;      % surrogateopt MaxFunctionEvaluations (요청대로 500)
+N_EVALS    = 500;      % surrogateopt MaxFunctionEvaluations
 
 %% 1) 모델 로드 -------------------------------------------------------------
 filepath = 'G:\공유 드라이브\COMSOL\fast_charging';
@@ -138,96 +138,122 @@ fprintf('CSV/MAT 저장 완료.\n출력 폴더: %s\n', out_dir);
 
 % ============================ Local Functions =============================
 function cost = evaluate_and_log_CCCV(C_rate, model, safety_eps, fn_csv)
-    % (1) 시뮬레이션
-    model.param.set('C_rate', num2str(C_rate));
-    model.study('std1').run();
+% 견고버전: 내부 try/catch. 실패 시 NaN 기록 + 큰 페널티 반환.
+    PENALTY = 1e9;
+    try
+        % (1) 시뮬레이션
+        model.param.set('C_rate', num2str(C_rate));
+        model.study('std1').run();
 
-    % (2) 시계열에서 충전 구간 파싱
-    expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil', ...
-            'liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
-    data = mpheval(model, expr, 'dataset','dset1','edim','point','selection',2,'solnum','all');
-    t=data.d1; V=data.d2; I=data.d3; soc=data.d4; vdiff=data.d5; cc=data.d6; cv=data.d7;
-    idx = (cc==1) | (cv==1);
+        % (2) 시계열에서 충전 구간 파싱
+        expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil', ...
+                'liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
+        data = mpheval(model, expr, 'dataset','dset1','edim','point','selection',2,'solnum','all');
+        t=data.d1; V=data.d2; I=data.d3; soc=data.d4; vdiff=data.d5; cc=data.d6; cv=data.d7;
+        idx = (cc==1) | (cv==1);
 
-    % (3) Global Variable에서 T_avg/T_max 마지막 시점값 취득
-    %     (전역 결과가 시간의 함수면 마지막 시간 스텝 값, 정적이면 단일 값)
-    Tavg_g = mpheval(model, 'T_avg', 'dataset','dset1', 'edim','domain', 'solnum','all');
-    Tmax_g = mpheval(model, 'T_max', 'dataset','dset1', 'edim','domain', 'solnum','all');
-    Tavg_val = Tavg_g.d1(end);
-    Tmax_val = Tmax_g.d1(end);
+        % (3) Global Variable에서 T_avg/T_max "피크값" 취득
+        [Tavg_val, Tmax_val] = get_temp_peaks(model, 'dset1');
 
-    % (4) 메트릭 계산 및 비용
-    if ~any(idx)
-        T = 1e6; s = -inf; t80=nan; cv_frac=nan; E_Wh=nan; vmin=nan; vmax=nan;
+        % (4) 메트릭 계산 및 비용
+        if ~any(idx)
+            T = PENALTY; s = -inf; t80=nan; cv_frac=nan; E_Wh=nan; vmin=nan; vmax=nan;
+            append_cccv_row(fn_csv, [C_rate, T, s, t80, cv_frac, E_Wh, vmin, vmax, Tavg_val, Tmax_val]);
+            cost = T; return;
+        end
+
+        tchg = t(idx); Vchg=V(idx); Ichg=I(idx); SOCchg=soc(idx); vchg=vdiff(idx); cvchg=cv(idx);
+        T    = tchg(end);
+        s    = min(vchg);
+        i80  = find(SOCchg >= 0.80, 1, 'first');
+        t80  = ~isempty(i80) * tchg(min(i80,end)) + isempty(i80) * nan;
+        cv_frac = mean(cvchg==1);
+        E_Wh = trapz(tchg, Vchg.*Ichg)/3600;
+        vmin = min(vchg); vmax = max(vchg);
+
+        if s <= safety_eps
+            cost = PENALTY + (safety_eps - s)*1e6;
+        else
+            cost = T;
+        end
+
         append_cccv_row(fn_csv, [C_rate, T, s, t80, cv_frac, E_Wh, vmin, vmax, Tavg_val, Tmax_val]);
-        cost = T; return;
+
+    catch ME
+        warning('CCCV 평가 실패(C=%.3g): %s', C_rate, ME.message);
+        append_cccv_row(fn_csv, [C_rate, PENALTY, -inf, nan, nan, nan, nan, nan, nan, nan]);
+        cost = PENALTY;
     end
-
-    tchg = t(idx); Vchg=V(idx); Ichg=I(idx); SOCchg=soc(idx); vchg=vdiff(idx); cvchg=cv(idx);
-    T    = tchg(end);
-    s    = min(vchg);
-    i80  = find(SOCchg >= 0.80, 1, 'first');
-    t80  = ~isempty(i80) * tchg(min(i80,end)) + isempty(i80) * nan;
-    cv_frac = mean(cvchg==1);
-    E_Wh = trapz(tchg, Vchg.*Ichg)/3600;
-    vmin = min(vchg); vmax = max(vchg);
-
-    % 비용(안전 위반시 강 페널티)
-    if s <= safety_eps
-        cost = 1e6 + (safety_eps - s)*1e5;
-    else
-        cost = T;
-    end
-
-    % (5) 로그 기록 (Global T_avg/T_max 포함)
-    append_cccv_row(fn_csv, [C_rate, T, s, t80, cv_frac, E_Wh, vmin, vmax, Tavg_val, Tmax_val]);
 end
 
 function cost = evaluate_and_log_MSCC(C, model, safety_eps, fn_csv)
-    % (1) 시뮬레이션
-    model.param.set('first_MSCC_Crate',  num2str(C(1)));
-    model.param.set('second_MSCC_Crate', num2str(C(2)));
-    model.param.set('third_MSCC_Crate',  num2str(C(3)));
-    model.param.set('fourth_MSCC_Crate', num2str(C(4)));
-    model.study('std2').run();
+% 견고버전: 내부 try/catch. 실패 시 NaN 기록 + 큰 페널티 반환.
+    PENALTY = 1e9;
+    try
+        % (1) 시뮬레이션
+        model.param.set('first_MSCC_Crate',  num2str(C(1)));
+        model.param.set('second_MSCC_Crate', num2str(C(2)));
+        model.param.set('third_MSCC_Crate',  num2str(C(3)));
+        model.param.set('fourth_MSCC_Crate', num2str(C(4)));
+        model.study('std2').run();
 
-    % (2) 시계열에서 충전 구간 파싱
-    expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil', ...
-            'liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
-    data = mpheval(model, expr, 'dataset','dset3','edim','point','selection',2,'solnum','all');
-    t=data.d1; V=data.d2; I=data.d3; soc=data.d4; vdiff=data.d5; cc=data.d6; cv=data.d7;
-    idx = (cc==1) | (cv==1);
+        % (2) 시계열에서 충전 구간 파싱
+        expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil', ...
+                'liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
+        data = mpheval(model, expr, 'dataset','dset3','edim','point','selection',2,'solnum','all');
+        t=data.d1; V=data.d2; I=data.d3; soc=data.d4; vdiff=data.d5; cc=data.d6; cv=data.d7;
+        idx = (cc==1) | (cv==1);
 
-    % (3) Global Variable에서 T_avg/T_max 마지막 시점값 취득
-    Tavg_g = mpheval(model, 'T_avg', 'dataset','dset3', 'edim','domain', 'solnum','all');
-    Tmax_g = mpheval(model, 'T_max', 'dataset','dset3', 'edim','domain', 'solnum','all');
-    Tavg_val = Tavg_g.d1(end);
-    Tmax_val = Tmax_g.d1(end);
+        % (3) Global Variable에서 T_avg/T_max "피크값" 취득
+        [Tavg_val, Tmax_val] = get_temp_peaks(model, 'dset3');
 
-    % (4) 메트릭 계산 및 비용
-    if ~any(idx)
-        T = 1e6; s = -inf; t80=nan; cv_frac=nan; E_Wh=nan; vmin=nan; vmax=nan;
+        % (4) 메트릭 계산 및 비용
+        if ~any(idx)
+            T = PENALTY; s = -inf; t80=nan; cv_frac=nan; E_Wh=nan; vmin=nan; vmax=nan;
+            append_mscc_row(fn_csv, [C(:).', T, s, t80, cv_frac, E_Wh, vmin, vmax, Tavg_val, Tmax_val]);
+            cost = T; return;
+        end
+
+        tchg = t(idx); Vchg=V(idx); Ichg=I(idx); SOCchg=soc(idx); vchg=vdiff(idx); cvchg=cv(idx);
+        T    = tchg(end);
+        s    = min(vchg);
+        i80  = find(SOCchg >= 0.80, 1, 'first');
+        t80  = ~isempty(i80) * tchg(min(i80,end)) + isempty(i80) * nan;
+        cv_frac = mean(cvchg==1);
+        E_Wh = trapz(tchg, Vchg.*Ichg)/3600;
+        vmin = min(vchg); vmax = max(vchg);
+
+        if s <= safety_eps
+            cost = PENALTY + (safety_eps - s)*1e6;
+        else
+            cost = T;
+        end
+
         append_mscc_row(fn_csv, [C(:).', T, s, t80, cv_frac, E_Wh, vmin, vmax, Tavg_val, Tmax_val]);
-        cost = T; return;
+
+    catch ME
+        warning('MSCC 평가 실패(C=[%g %g %g %g]): %s', C(1),C(2),C(3),C(4), ME.message);
+        append_mscc_row(fn_csv, [C(:).', PENALTY, -inf, nan, nan, nan, nan, nan, nan, nan]);
+        cost = PENALTY;
     end
+end
 
-    tchg = t(idx); Vchg=V(idx); Ichg=I(idx); SOCchg=soc(idx); vchg=vdiff(idx); cvchg=cv(idx);
-    T    = tchg(end);
-    s    = min(vchg);
-    i80  = find(SOCchg >= 0.80, 1, 'first');
-    t80  = ~isempty(i80) * tchg(min(i80,end)) + isempty(i80) * nan;
-    cv_frac = mean(cvchg==1);
-    E_Wh = trapz(tchg, Vchg.*Ichg)/3600;
-    vmin = min(vchg); vmax = max(vchg);
-
-    if s <= safety_eps
-        cost = 1e6 + (safety_eps - s)*1e5;
-    else
-        cost = T;
+function [Tavg_peak, Tmax_peak] = get_temp_peaks(model, dset)
+% 전역 변수 T_avg/T_max를 시간 전 구간('solnum','all')으로 취득 후 피크(최대) 계산
+    Tavg_peak = nan; Tmax_peak = nan;
+    try
+        Tavg_g = mpheval(model, 'T_avg', 'dataset', dset, 'edim','domain', 'solnum','all');
+        Tavg_ts = Tavg_g.d1(:);
+        Tavg_peak = max(Tavg_ts, [], 'omitnan');
+    catch
+        % 그대로 NaN 유지
     end
-
-    % (5) 로그 기록 (Global T_avg/T_max 포함)
-    append_mscc_row(fn_csv, [C(:).', T, s, t80, cv_frac, E_Wh, vmin, vmax, Tavg_val, Tmax_val]);
+    try
+        Tmax_g = mpheval(model, 'T_max', 'dataset', dset, 'edim','domain', 'solnum','all');
+        Tmax_ts = Tmax_g.d1(:);
+        Tmax_peak = max(Tmax_ts, [], 'omitnan');
+    catch
+    end
 end
 
 function append_cccv_row(fn, row)
