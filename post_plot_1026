@@ -47,6 +47,116 @@ fprintf('  CCCV log: %s\n', cccv_log);
 fprintf('  MSCC  log: %s\n', mscc_log);
 
 
+%% A) run_summary_*.mat 로드 → 최적 C 불러와서 COMSOL로 OPT 시계열 생성
+% - 결과: timeseries/CCCV_opt.csv, timeseries/MSCC_opt.csv (있으면 갱신)
+import com.comsol.model.*
+import com.comsol.model.util.*
+
+% (A1) MAT 파일 찾기 & 로드
+mat_list = dir(fullfile(run_dir, 'run_summary_*.mat'));
+assert(~isempty(mat_list), 'run_summary_*.mat 이(가) 없습니다: %s', run_dir);
+[~,ix] = max([mat_list.datenum]);
+mat_path = fullfile(mat_list(ix).folder, mat_list(ix).name);
+S = load(mat_path);
+fprintf('  Loaded MAT: %s\n', mat_path);
+
+% (A2) 최적 C-rate 확보 (MAT 우선, 없으면 로그에서 추출)
+eps_s = 0.02;   % 안전 임계 (로그 필터용, 필요시 조정)
+
+if isfield(S,'optimal_C_rate')
+    optimal_C_rate = S.optimal_C_rate;
+else
+    % CCCV 로그에서 s>eps, T 최소 행
+    Lc = readtable(cccv_log); Lc = Lc(Lc.s > eps_s, :);
+    assert(~isempty(Lc),'CCCV 최적값을 MAT/로그에서 찾지 못했습니다.');
+    [~,i] = min(Lc.T); optimal_C_rate = Lc.C(i);
+end
+
+if isfield(S,'optimal_C_mscc')
+    optimal_C_mscc = S.optimal_C_mscc;
+else
+    % MSCC 로그에서 s>eps, T 최소 행
+    Lm = readtable(mscc_log); Lm = Lm(Lm.s > eps_s, :);
+    assert(~isempty(Lm),'MSCC 최적값을 MAT/로그에서 찾지 못했습니다.');
+    [~,i] = min(Lm.T); optimal_C_mscc = table2array(Lm(i,{'C1','C2','C3','C4'}));
+end
+
+fprintf('  optimal_C_rate = %.6g\n', optimal_C_rate);
+fprintf('  optimal_C_mscc = [%.6g %.6g %.6g %.6g]\n', optimal_C_mscc);
+
+% (A3) COMSOL 모델 로드 (경로는 환경에 맞게)
+filepath = 'G:\공유 드라이브\COMSOL\fast_charging';
+filename = 'ES_MSCC_PC_1015.mph';
+full_mph = fullfile(filepath, filename);
+assert(isfile(full_mph), 'mph 파일이 없습니다: %s', full_mph);
+model = mphload(full_mph);
+ModelUtil.showProgress(true);
+disp('모델 불러오기 완료.');
+
+model.study('std1').feature('time').set('tlist', 'range(0,10,3600)');
+model.study('std2').feature('time').set('tlist', 'range(0,10,3600)');
+mphnavigator(model);
+
+% (A4) 최적값으로 각 study 1회 실행 → OPT 시계열 CSV 저장
+opt_cccv_csv = fullfile(ts_dir, 'CCCV_opt.csv');
+opt_mscc_csv = fullfile(ts_dir, 'MSCC_opt.csv');
+
+try
+    dump_timeseries_CCCV(model, optimal_C_rate, opt_cccv_csv);   % 아래 Local 함수 사용
+    fprintf('  Wrote: %s\n', opt_cccv_csv);
+catch ME
+    warning('CCCV OPT 시계열 생성 실패: %s', ME.message);
+end
+
+try
+    dump_timeseries_MSCC(model, optimal_C_mscc, opt_mscc_csv);   % 아래 Local 함수 사용
+    fprintf('  Wrote: %s\n', opt_mscc_csv);
+catch ME
+    warning('MSCC OPT 시계열 생성 실패: %s', ME.message);
+end
+
+% === Local helpers (Post-Plot 파일 하단 Local helper 영역에 함께 두어도 됩니다) ===
+function dump_timeseries_CCCV(model, C_rate, fn_csv)
+    % study/dataset 이름: std1 / dset1
+    model.param.set('C_rate', num2str(C_rate));
+    model.study('std1').run();
+
+    expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil', ...
+            'liion.cdc1.CC_CH','liion.cdc1.CV_CH','T_avg','T_max'};
+    data = mpheval(model, expr, 'dataset','dset1','edim','point','selection',2,'solnum','all');
+
+    tbl = table(data.d1, data.d2, data.d3, data.d4, data.d5, data.d6, data.d7, ...
+        toColSafe(data,8), toColSafe(data,9), ...
+        'VariableNames', {'t','E_cell','I_cell','SOC','phis_minus_phil','CC_flag','CV_flag','T_avg','T_max'});
+    % 충전 구간만 저장
+    tbl = tbl(tbl.CC_flag==1 | tbl.CV_flag==1, :);
+    writetable(tbl, fn_csv);
+end
+
+function dump_timeseries_MSCC(model, Cvec, fn_csv)
+    % study/dataset 이름: std2 / dset3
+    model.param.set('first_MSCC_Crate',  num2str(Cvec(1)));
+    model.param.set('second_MSCC_Crate', num2str(Cvec(2)));
+    model.param.set('third_MSCC_Crate',  num2str(Cvec(3)));
+    model.param.set('fourth_MSCC_Crate', num2str(Cvec(4)));
+    model.study('std2').run();
+
+    expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil', ...
+            'liion.cdc1.CC_CH','liion.cdc1.CV_CH','T_avg','T_max'};
+    data = mpheval(model, expr, 'dataset','dset3','edim','point','selection',2,'solnum','all');
+
+    tbl = table(data.d1, data.d2, data.d3, data.d4, data.d5, data.d6, data.d7, ...
+        toColSafe(data,8), toColSafe(data,9), ...
+        'VariableNames', {'t','E_cell','I_cell','SOC','phis_minus_phil','CC_flag','CV_flag','T_avg','T_max'});
+    tbl = tbl(tbl.CC_flag==1 | tbl.CV_flag==1, :);
+    writetable(tbl, fn_csv);
+end
+
+function col = toColSafe(data, idx)
+    try, col = data.(['d' num2str(idx)]);
+    catch, col = nan(size(data.d1));
+    end
+end
 
 % 색상
 blue  = [0, 115, 194]/255;   % CCCV
@@ -331,37 +441,37 @@ for i=1:4
 end
 export_png(f, fullfile(fig_dir,'mscc_distribution_overview.png'));
 
-%% 8.10) Parallel coordinates (CSV-based) ----------------------------------
-Z = [X_mscc, TM.T, TM.s];
-Z = (Z - nanmean(Z,1)) ./ nanstd(Z,0,1);
-ok = all(isfinite(Z),2);
-Z = Z(ok,:);
-succOK = TM.s(ok) > eps_s;
-
-labels = [varNames, {'T','s'}];
-f = figure(216); clf; hold on; grid on;
-
-% 1) 먼저 기본 플롯 (색 지정 없이)
-h = parallelcoords(Z, ...
-    'Labels',   labels, ...
-    'Group',    succOK, ...
-    'Quantile', 0.5, ...
-    'LineWidth',0.8);
-
-% 2) 그룹별 색상 사후 적용 (false=1, true=2)
-gcolors = [0.70 0.10 0.10;  % 실패(붉은)
-           0.10 0.40 0.80]; % 성공(파란)
-succOK = succOK(:);
-for i = 1:numel(h)
-    gi = double(succOK(i)) + 1;      % false->1, true->2
-    if gi<1 || gi>2 || ~isfinite(gi), gi = 1; end
-    set(h(i), 'Color', gcolors(gi,:));
-end
-
-title('MSCC Parallel Coordinates (CSV, succ= s>\epsilon)');
-export_png(f, fullfile(fig_dir,'mscc_parallelcoords_csv.png'));
-
-
+% %% 8.10) Parallel coordinates (CSV-based) ----------------------------------
+% Z = [X_mscc, TM.T, TM.s];
+% Z = (Z - nanmean(Z,1)) ./ nanstd(Z,0,1);
+% ok = all(isfinite(Z),2);
+% Z = Z(ok,:);
+% succOK = TM.s(ok) > eps_s;
+% 
+% labels = [varNames, {'T','s'}];
+% f = figure(216); clf; hold on; grid on;
+% 
+% % 1) 먼저 기본 플롯 (색 지정 없이)
+% h = parallelcoords(Z, ...
+%     'Labels',   labels, ...
+%     'Group',    succOK, ...
+%     'Quantile', 0.5, ...
+%     'LineWidth',0.8);
+% 
+% % 2) 그룹별 색상 사후 적용 (false=1, true=2)
+% gcolors = [0.70 0.10 0.10;  % 실패(붉은)
+%            0.10 0.40 0.80]; % 성공(파란)
+% succOK = succOK(:);
+% for i = 1:numel(h)
+%     gi = double(succOK(i)) + 1;      % false->1, true->2
+%     if gi<1 || gi>2 || ~isfinite(gi), gi = 1; end
+%     set(h(i), 'Color', gcolors(gi,:));
+% end
+% 
+% title('MSCC Parallel Coordinates (CSV, succ= s>\epsilon)');
+% export_png(f, fullfile(fig_dir,'mscc_parallelcoords_csv.png'));
+% 
+% 
 
 %% 9) 기존 Figure (대표 시계열 CSV 기반) -----------------------------------
 % timeseries 디렉토리에 다음 파일들을 자동 검색 후 그려줌:
