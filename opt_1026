@@ -34,7 +34,7 @@ fn_mscc = fullfile(out_dir, ['mscc_optimization_log_' ts '.csv']);
 
 % 안전 임계 및 surrogateopt 평가 횟수
 safety_eps = 0.02;     % [V]
-N_EVALS    = 500;      % surrogateopt MaxFunctionEvaluations
+N_EVALS    = 1000;      % surrogateopt MaxFunctionEvaluations
 
 %% 1) 모델 로드 -------------------------------------------------------------
 filepath = 'G:\공유 드라이브\COMSOL\fast_charging';
@@ -319,3 +319,4 @@ end
 function col = toColSafe(data, idx)
     try, col = data.(['d' num2str(idx)]); catch, col = nan(size(data.d1)); end
 end
+
