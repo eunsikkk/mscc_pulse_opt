@@ -1,0 +1,139 @@
+% =========================================================================
+% COMSOL-MATLAB: MSCC+Pulse 전용 최적화 (C1,C2=6C 고정, 6개 변수 탐색)
+% =========================================================================
+clc; clear; close all;
+import com.comsol.model.*
+import com.comsol.model.util.*
+
+%% 0) 모델 로드 & 기본 설정 -------------------------------------------------
+filepath = 'C:\Users\dsdsd\Downloads';
+filename = 'ES_MSCC_PC_1022_feedback_ver (1).mph';   % 콤솔 모델: pulse_freq은 "period[s]" 단위
+full_path = fullfile(filepath, filename);
+assert(isfile(full_path), 'mph 파일이 없습니다: %s', full_path);
+
+model = mphload(full_path);
+ModelUtil.showProgress(true);
+disp('모델 불러오기 완료.');
+
+% 로그 파일 초기화
+log_csv = 'pulse_mscc_optimization_log.csv';
+if exist(log_csv,'file'), delete(log_csv); end
+writematrix(["C3","C4","SOC_start","SOC_duration","I_rest","pulse_period_s","duty","T_s","min_overpot_V"], log_csv);
+
+%% 1) 최적화 변수/경계 -------------------------------------------------------
+% x = [C3, C4, SOC_start, SOC_duration, I_rest, pulse_period_s]
+lb = [ 0.5, 0.5, 0.50, 0.05, -0.2,  10 ];
+ub = [ 3.0, 3.0, 0.80, 0.30,  0.2, 300 ];
+
+opts = optimoptions('surrogateopt', ...
+    'MaxFunctionEvaluations', 2, ...
+    'Display','iter', ...
+    'PlotFcn','surrogateoptplot');
+
+%% 2) 목적함수 ---------------------------------------------------------------
+obj = @(x) evaluate_pulse_mscc_only(x, model, log_csv);
+
+[opt_x, fval, exitflag, output, trials] = surrogateopt(obj, lb, ub, opts);
+
+fprintf('\n=== 최적 결과 (MSCC+Pulse 전용) ===\n');
+fprintf('C1=6, C2=6 (고정)\n');
+fprintf('C3 = %.3f C, C4 = %.3f C\n', opt_x(1), opt_x(2));
+fprintf('SOC_start = %.3f, SOC_duration = %.3f (end=%.3f)\n', opt_x(3), opt_x(4), opt_x(3)+opt_x(4));
+fprintf('I_rest = %.3f C\n', opt_x(5));
+fprintf('pulse_period = %.1f s\n', opt_x(6));
+fprintf('duty_cycle = 0.5 (고정)\n');
+fprintf('충전 시간(목적값) T = %.2f s\n', fval);
+
+%% 3) 최적 해로 한 번 더 시뮬레이션 & 시계열 확보 ---------------------------
+set_params_for_run(model, opt_x);
+model.study('std3').run();
+
+expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil','liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
+data = mpheval(model, expr, 'dataset','dset37', 'edim','point','selection',2,'solnum','all');
+
+t = data.d1; V = data.d2; I = data.d3; SOC = data.d4; over = data.d5; cc = data.d6; cv = data.d7;
+idx = (cc==1) | (cv==1);
+T_final = t(find(idx,1,'last'));
+fprintf('재실행 완료: 최종 충전시간 T = %.2f s\n', T_final);
+
+TBL = table(t(idx), V(idx), I(idx), SOC(idx), over(idx), cc(idx), cv(idx), ...
+    'VariableNames',{'t','E_cell','I_cell','SOC','phis_minus_phil','CC_flag','CV_flag'});
+writetable(TBL, 'MSCC_pulse_opt_timeseries.csv');
+disp('MSCC_pulse_opt_timeseries.csv 저장 완료.');
+
+%% =================== Local Functions =====================================
+function cost = evaluate_pulse_mscc_only(x, model, log_csv)
+    % x = [C3, C4, SOC_start, SOC_duration, I_rest, pulse_period_s]
+    persistent f_count
+    if isempty(f_count), f_count = 0; end
+    f_count = f_count + 1;
+
+    C3 = x(1); 
+    C4 = x(2);
+    s0 = x(3); 
+    sd = x(4); 
+    s1 = s0 + sd;
+    Irest = x(5); 
+    Tper = x(6); 
+    duty = 0.5;
+
+    % ==== 진행중인 시도 및 파라미터 표시 ====
+    fprintf('\n[Pulse-MSCC F-count %03d]  ', f_count);
+    fprintf('C3=%.3f C, C4=%.3f C, SOC_start=%.3f, SOC_dur=%.3f, end=%.3f, I_rest=%.3f C, period=%.1f s\n', ...
+        C3, C4, s0, sd, s1, Irest, Tper);
+
+    % ==== 유효성 검증 ====
+    if s1 > 0.898 || s1 <= s0
+        fprintf(' → 무효 SOC 영역 (%.3f ~ %.3f) → 페널티\n', s0, s1);
+        cost = 1e9;
+        return;
+    end
+
+    try
+        % MSCC Crate 설정 (C1,C2=6 고정)
+        model.param.set('first_MSCC_Crate','6');
+        model.param.set('second_MSCC_Crate','6');
+        model.param.set('third_MSCC_Crate',num2str(C3));
+        model.param.set('fourth_MSCC_Crate',num2str(C4));
+
+        % Pulse 파라미터 설정
+        model.param.set('pulse_start_soc_param',num2str(s0));
+        model.param.set('pulse_duration_soc_param',num2str(sd));
+        model.param.set('pulse_rest_current_param_coeffi',num2str(Irest));
+        model.param.set('pulse_freq',[num2str(Tper) '[s]']); % period 그대로
+        model.param.set('duty_cycle','0.5');
+
+        % 실행
+        model.study('std3').run();
+
+        % 결과 평가
+        expr = {'t','phis-phil','liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
+        D = mpheval(model,expr,'dataset','dset37','edim','point','selection',2,'solnum','all');
+        t = D.d1; over = D.d2; cc = D.d3; cv = D.d4;
+        idx = (cc==1)|(cv==1);
+
+        if ~any(idx)
+            fprintf(' → 충전구간 없음 → 페널티\n');
+            cost = 1e8;
+            return;
+        end
+
+        Tmin = min(over(idx));
+        if Tmin <= 0
+            fprintf(' → 안전 위반 (min over = %.4f V) → 페널티\n', Tmin);
+            cost = 2e7 - 1e6*Tmin;
+            return;
+        end
+
+        Tcharge = t(find(idx,1,'last'));
+        cost = Tcharge;
+
+        fprintf(' → 성공 | 충전시간 = %.2f s, min(phis-phil)=%.4f V\n', Tcharge, Tmin);
+
+        writematrix([C3, C4, s0, sd, Irest, Tper, duty, Tcharge, Tmin], log_csv, 'WriteMode','append');
+
+    catch ME
+        fprintf(' → 오류 발생: %s → 페널티\n', ME.message);
+        cost = 1e8;
+    end
+end
