@@ -1,0 +1,427 @@
+% =========================================================================
+% COMSOL-MATLAB: CCCV, MSCC 및 MSCC+Pulse 프로토콜 순차 최적화
+% 최종 완성본 (2025-10-15)
+% =========================================================================
+% clc; clear; close all;
+import com.comsol.model.*
+import com.comsol.model.util.*
+
+%% 1단계: 모델 불러오기 및 공통 설정
+% --- 로그 파일 초기화 ---
+if exist('mscc_optimization_log.csv', 'file')
+    delete('mscc_optimization_log.csv');
+end
+if exist('pulse_optimization_log.csv', 'file')
+    delete('pulse_optimization_log.csv');
+end
+filepath = 'C:\Users\user\Downloads'; 
+filename = 'ES_MSCC_PC_1015.mph';   % 중요: 이 mph 파일은 펄스 파라미터를 받을 수 있도록 수정되어 있어야 합니다.
+full_path = fullfile(filepath, filename);
+model = mphload(full_path);
+ModelUtil.showProgress(true);
+disp('모델 불러오기 완료.');
+% --- 그래프 색상 테마 정의 ---
+blue_color = [0, 115, 194] / 255;    % #0073C2 (CCCV용)
+red_color = [205, 83, 76] / 255;     % #CD534C (MSCC용)
+green_color = [0, 158, 115] / 255;   % #009E73 (MSCC+Pulse용)
+
+% =========================================================================
+% PART 1: CCCV 프로토콜 최적화
+% =========================================================================
+%%
+disp('===== PART 1: CCCV 프로토콜 최적화를 시작합니다 =====');
+lb_cccv = 0.1; 
+ub_cccv = 6.0; 
+obj_cccv = @(C) evaluate_cccv(C, model);
+opts_cccv = optimoptions('surrogateopt', 'MaxFunctionEvaluations', 100, 'Display', 'iter', 'PlotFcn', 'surrogateoptplot');
+[optimal_C_rate, cccv_min_time, ~, ~, trials_cccv] = surrogateopt(obj_cccv, lb_cccv, ub_cccv, opts_cccv);
+fprintf('\n--- CCCV 최적화 결과 ---\n');
+fprintf('최적 CCCV 충전 시간: %.2f 초\n', cccv_min_time);
+fprintf('최적 C-rate: %.2f C\n\n', optimal_C_rate);
+
+% =========================================================================
+% PART 2: MSCC 프로토콜 최적화 (Baseline 탐색)
+% =========================================================================
+%%
+disp('===== PART 2: MSCC (Baseline) 프로토콜 최적화를 시작합니다 =====');
+lb_mscc = [0.1, 0.1, 0.1, 0.1];
+ub_mscc = [6.0, 6.0, 6.0, 6.0];
+obj_mscc = @(C) evaluate_mscc(C, model);
+opts_mscc = optimoptions('surrogateopt', 'MaxFunctionEvaluations', 100, 'Display', 'iter', 'PlotFcn', 'surrogateoptplot');
+[optimal_C_mscc, mscc_min_time, ~, ~, trials_mscc] = surrogateopt(obj_mscc, lb_mscc, ub_mscc, opts_mscc);
+fprintf('\n--- MSCC (Baseline) 최적화 결과 ---\n');
+fprintf('최적 MSCC 충전 시간: %.2f 초\n', mscc_min_time);
+fprintf('최적 C-rate 조합:\n');
+fprintf('  C1: %.2f C, C2: %.2f C, C3: %.2f C, C4: %.2f C\n\n', optimal_C_mscc(1), optimal_C_mscc(2), optimal_C_mscc(3), optimal_C_mscc(4));
+% 
+% % =========================================================================
+% % PART 3: 선제적 펄스 삽입 최적화
+% % =========================================================================
+%%
+% --- PART 2 결과 (최적 MSCC C-rate)를 상수로 정의 ---
+optimal_C_mscc_baseline = optimal_C_mscc;
+
+% --- 펄스 파라미터 최적화 문제 정의 ---
+disp('===== PART 3: 선제적 펄스 파라미터 최적화를 시작합니다 =====');
+
+%       [pulse_start_soc, duration_soc, rest_current_coeffi, pulse_period, duty_cycle]
+lb_pulse = [0.1,              0.05,            -1.0,                 50,           10]; % 하한값
+ub_pulse = [0.7,              0.30,            1.0,                 300,           90]; % 상한값
+
+% 목적 함수에 '최적 MSCC C-rate'를 추가로 전달
+obj_pulse = @(X) evaluate_pulse_insertion(X, model, optimal_C_mscc_baseline);
+opts_pulse = optimoptions('surrogateopt', 'MaxFunctionEvaluations', 100, 'Display', 'iter', 'PlotFcn', 'surrogateoptplot');
+
+[optimal_pulse_params, min_time_with_pulse, ~, ~, trials_pulse] = surrogateopt(obj_pulse, lb_pulse, ub_pulse, opts_pulse);
+
+% --- 최종 결과 출력 ---
+fprintf('\n--- 펄스 삽입 최적화 결과 ---\n');
+fprintf('최적 MSCC Baseline 충전 시간: %.2f 초\n', mscc_min_time);
+fprintf('펄스 삽입 후 최적 충전 시간: %.2f 초\n', min_time_with_pulse);
+fprintf('성능 개선 (vs MSCC Baseline): %.2f 초 단축\n', mscc_min_time - min_time_with_pulse);
+fprintf('최적 펄스 파라미터 조합:\n');
+fprintf('  Pulse Start SOC: %.1f %%\n', optimal_pulse_params(1));
+fprintf('  Pulse Duration SOC: %.1f %%\n', optimal_pulse_params(2));
+fprintf('  Rest Current Coeff: %.2f\n', optimal_pulse_params(3));
+fprintf('  Pulse Period: %.1f s\n', optimal_pulse_params(4));
+fprintf('  Duty Cycle: %.1f %%\n\n', optimal_pulse_params(5));
+
+% =========================================================================
+% PART 4: 최종 비교 시뮬레이션 및 데이터 저장
+% =========================================================================
+%%
+disp('--- 최적 프로토콜 최종 비교 시뮬레이션을 실행합니다 ---');
+expressions = {'t', 'phis-phil', 'SOC', 'E_cell', 'liion.cdc1.Icell', 'liion.cdc1.CC_CH', 'liion.cdc1.CV_CH'}; 
+
+% --- 1. 최적 CCCV 실행 및 데이터 저장 ---
+model.param.set('C_rate', num2str(optimal_C_rate));
+model.study('std1').run();
+data_cccv_final = mpheval(model, expressions, 'dataset', 'dset1', 'edim', 'point', 'selection', 2, 'solnum', 'all');
+charge_flag_cccv = data_cccv_final.d6; cv_flag_cccv = data_cccv_final.d7;
+charge_indices_cccv = (charge_flag_cccv == 1) | (cv_flag_cccv == 1);
+time_cccv_charging = data_cccv_final.d1(charge_indices_cccv);
+V_diff_cccv_charging = data_cccv_final.d2(charge_indices_cccv);
+SOC_cccv_charging = data_cccv_final.d3(charge_indices_cccv);
+E_cell_cccv_charging = data_cccv_final.d4(charge_indices_cccv);
+I_cell_cccv_charging = data_cccv_final.d5(charge_indices_cccv);
+
+% --- 2. 최적 MSCC (Baseline) 실행 및 데이터 저장 ---
+model.param.set('first_MSCC_Crate', num2str(optimal_C_mscc(1)));
+model.param.set('second_MSCC_Crate', num2str(optimal_C_mscc(2)));
+model.param.set('third_MSCC_Crate', num2str(optimal_C_mscc(3)));
+model.param.set('fourth_MSCC_Crate', num2str(optimal_C_mscc(4)));
+model.study('std2').run();
+data_mscc_final = mpheval(model, expressions, 'dataset', 'dset3', 'edim', 'point', 'selection', 2, 'solnum', 'all');
+charge_flag_mscc = data_mscc_final.d6; cv_flag_mscc = data_mscc_final.d7;
+charge_indices_mscc = (charge_flag_mscc == 1) | (cv_flag_mscc == 1);
+time_mscc_charging = data_mscc_final.d1(charge_indices_mscc);
+V_diff_mscc_charging = data_mscc_final.d2(charge_indices_mscc);
+SOC_mscc_charging = data_mscc_final.d3(charge_indices_mscc);
+E_cell_mscc_charging = data_mscc_final.d4(charge_indices_mscc);
+I_cell_mscc_charging = data_mscc_final.d5(charge_indices_mscc);
+
+% --- 3. 최적 MSCC+Pulse 실행 및 데이터 저장 ---
+model.param.set('first_MSCC_Crate', num2str(optimal_C_mscc_baseline(1)));
+model.param.set('second_MSCC_Crate', num2str(optimal_C_mscc_baseline(2)));
+model.param.set('third_MSCC_Crate', num2str(optimal_C_mscc_baseline(3)));
+model.param.set('fourth_MSCC_Crate', num2str(optimal_C_mscc_baseline(4)));
+model.param.set('pulse_start_soc_param', num2str(optimal_pulse_params(1)));
+model.param.set('pulse_duration_soc_param', num2str(optimal_pulse_params(2)));
+model.param.set('pulse_rest_current_param_coeffi', num2str(optimal_pulse_params(3)));
+model.param.set('pulse_freq', [num2str(optimal_pulse_params(4)) '[s]']);
+model.param.set('duty_cycle', [num2str(optimal_pulse_params(4)) '[%]']);
+model.study('std3').run();
+data_pulse_final = mpheval(model, expressions, 'dataset', 'dset37', 'edim', 'point', 'selection', 2, 'solnum', 'all');
+charge_flag_pulse = data_pulse_final.d6; cv_flag_pulse = data_pulse_final.d7;
+charge_indices_pulse = (charge_flag_pulse == 1) | (cv_flag_pulse == 1);
+time_pulse_charging = data_pulse_final.d1(charge_indices_pulse);
+V_diff_pulse_charging = data_pulse_final.d2(charge_indices_pulse);
+SOC_pulse_charging = data_pulse_final.d3(charge_indices_pulse);
+E_cell_pulse_charging = data_pulse_final.d4(charge_indices_pulse);
+I_cell_pulse_charging = data_pulse_final.d5(charge_indices_pulse);
+
+% =========================================================================
+% PART 5: 최종 비교 그래프 생성
+% =========================================================================
+%%
+% disp('최종 프로토콜 비교 그래프를 생성합니다.');
+% --- 최적 CCCV 결과 그래프 (Figure 10, 11, 12) ---
+figure(10);
+colororder({'k', 'k'}); 
+yyaxis left;
+plot(time_cccv_charging, E_cell_cccv_charging, '-', 'LineWidth', 1.5, 'Color', blue_color);
+ylabel('셀 전압 (V)'); ylim([2.5 4.5]);
+yyaxis right;
+plot(time_cccv_charging, I_cell_cccv_charging, '--', 'LineWidth', 1.5, 'Color', blue_color);
+ylabel('셀 전류 (A)');
+title('[최적 CCCV] 시간-전압/전류 프로파일');
+xlabel('시간 (t)'); grid on; set(gca, 'FontSize', 12);
+figure(11);
+plot(SOC_cccv_charging, V_diff_cccv_charging, 'LineWidth', 1.5, 'Color', blue_color);
+title('[최적 CCCV] SOC-과전압 프로파일');
+xlabel('State of Charge (SOC)'); ylabel('과전압 (V)'); grid on; set(gca, 'FontSize', 12);
+figure(12);
+plot(time_cccv_charging, V_diff_cccv_charging, 'LineWidth', 1.5, 'Color', blue_color);
+title('[최적 CCCV] 시간-과전압 프로파일');
+xlabel('시간 (t)'); ylabel('과전압 (V)'); grid on; set(gca, 'FontSize', 12);
+
+% --- 최적 MSCC 결과 그래프 (Figure 20, 21, 22) ---
+figure(20);
+colororder({'k', 'k'});
+yyaxis left;
+plot(time_mscc_charging, E_cell_mscc_charging, '-', 'LineWidth', 1.5, 'Color', red_color);
+ylabel('셀 전압 (V)'); ylim([2.5 4.5]);
+yyaxis right;
+plot(time_mscc_charging, I_cell_mscc_charging, '--', 'LineWidth', 1.5, 'Color', red_color);
+ylabel('셀 전류 (A)');
+title('[최적 MSCC] 시간-전압/전류 프로파일');
+xlabel('시간 (t)'); grid on; set(gca, 'FontSize', 12);
+figure(21);
+plot(SOC_mscc_charging, V_diff_mscc_charging, 'LineWidth', 1.5, 'Color', red_color);
+title('[최적 MSCC] SOC-과전압 프로파일');
+xlabel('State of Charge (SOC)'); ylabel('과전압 (V)'); grid on; set(gca, 'FontSize', 12);
+figure(22);
+plot(time_mscc_charging, V_diff_mscc_charging, 'LineWidth', 1.5, 'Color', red_color);
+title('[최적 MSCC] 시간-과전압 프로파일');
+xlabel('시간 (t)'); ylabel('과전압 (V)'); grid on; set(gca, 'FontSize', 12);
+
+% --- [추가] 최적 MSCC+Pulse 결과 그래프 (Figure 30, 31, 32) ---
+figure(30);
+colororder({'k', 'k'});
+yyaxis left;
+plot(time_pulse_charging, E_cell_pulse_charging, '-', 'LineWidth', 1.5, 'Color', green_color);
+ylabel('셀 전압 (V)'); ylim([2.5 4.5]);
+yyaxis right;
+plot(time_pulse_charging, I_cell_pulse_charging, '--', 'LineWidth', 1.5, 'Color', green_color);
+ylabel('셀 전류 (A)');
+title('[최적 MSCC+Pulse] 시간-전압/전류 프로파일');
+xlabel('시간 (t)'); grid on; set(gca, 'FontSize', 12);
+figure(31);
+plot(SOC_pulse_charging, V_diff_pulse_charging, 'LineWidth', 1.5, 'Color', green_color);
+title('[최적 MSCC+Pulse] SOC-과전압 프로파일');
+xlabel('State of Charge (SOC)'); ylabel('과전압 (V)'); grid on; set(gca, 'FontSize', 12);
+figure(32);
+plot(time_pulse_charging, V_diff_pulse_charging, 'LineWidth', 1.5, 'Color', green_color);
+title('[최적 MSCC+Pulse] 시간-과전압 프로파일');
+xlabel('시간 (t)'); ylabel('과전압 (V)'); grid on; set(gca, 'FontSize', 12);
+
+% --- 에너지 계산 ---
+energy_cccv = cumtrapz(time_cccv_charging, E_cell_cccv_charging .* I_cell_cccv_charging) / 3600; % Wh
+energy_mscc = cumtrapz(time_mscc_charging, E_cell_mscc_charging .* I_cell_mscc_charging) / 3600; % Wh
+energy_pulse = cumtrapz(time_pulse_charging, E_cell_pulse_charging .* I_cell_pulse_charging) / 3600; % Wh
+
+% --- 3가지 프로토콜 통합 비교 그래프 (Figure 100~) ---
+figure(100);
+plot(time_cccv_charging, energy_cccv, 'LineWidth', 1.5, 'Color', blue_color);
+hold on;
+plot(time_mscc_charging, energy_mscc, 'LineWidth', 1.5, 'Color', red_color);
+plot(time_pulse_charging, energy_pulse, 'LineWidth', 1.5, 'Color', green_color);
+hold off;
+title('누적 충전 에너지 비교');
+xlabel('시간 (t)'); ylabel('누적 에너지 (Wh)');
+legend('최적 CCCV', '최적 MSCC', '최적 MSCC+Pulse'); grid on; set(gca, 'FontSize', 12);
+
+figure(101);
+colororder({'k', 'k'}); 
+yyaxis left; % 전압
+plot(time_cccv_charging, E_cell_cccv_charging, '-', 'LineWidth', 1.2, 'Color', blue_color); hold on;
+plot(time_mscc_charging, E_cell_mscc_charging, '-', 'LineWidth', 1.2, 'Color', red_color);
+plot(time_pulse_charging, E_cell_pulse_charging, '-', 'LineWidth', 1.2, 'Color', green_color);
+ylabel('셀 전압 (V)'); ylim([2.5 4.5]);
+yyaxis right; % 전류
+plot(time_cccv_charging, I_cell_cccv_charging, '--', 'LineWidth', 1.5, 'Color', blue_color); hold on;
+plot(time_mscc_charging, I_cell_mscc_charging, '--', 'LineWidth', 1.5, 'Color', red_color);
+plot(time_pulse_charging, I_cell_pulse_charging, '--', 'LineWidth', 1.5, 'Color', green_color);
+ylabel('셀 전류 (A)'); hold off; grid on; title('3가지 프로토콜 V-I 직접 비교'); xlabel('시간(s)');
+legend('CCCV(V)', 'MSCC(V)', 'MSCC+Pulse(V)', 'CCCV(I)', 'MSCC(I)', 'MSCC+Pulse(I)');
+set(gca, 'FontSize', 12);
+
+% =========================================================================
+% PART 6: 고급 최적화 결과 시각화
+% =========================================================================
+disp('고급 최적화 결과 시각화를 시작합니다...');
+%% 그림 1: 목적 함수 수렴 플롯 (trials 사용)
+figure(200); % Figure 번호 중복 방지
+plot(1:length(trials_mscc.Fval), trials_mscc.Fval, 'b.-', 'MarkerSize', 15);
+title('MSCC 최적화 수렴 과정');
+xlabel('함수 실행 횟수');
+ylabel('목적 함수 값');
+grid on; set(gca, 'FontSize', 12);
+
+%% 그림 2: 성공적인 프로토콜 패턴 분석 (병렬 좌표 플롯)
+all_C_rates = trials_mscc.X;
+all_costs = trials_mscc.Fval;
+all_plot_data = [all_C_rates, all_costs];
+num_total_trials = length(all_costs);
+grouping_data = cell(num_total_trials, 1);
+success_indices = all_costs < 10000;
+grouping_data(success_indices) = {'성공 프로토콜'};
+grouping_data(~success_indices) = {'실패 프로토콜'};
+figure(201); % Figure 번호 중복 방지
+variable_names = {'C_rate_1', 'C_rate_2', 'C_rate_3', 'C_rate_4', 'Charge_Time_s'};
+plot_table = array2table(all_plot_data, 'VariableNames', variable_names);
+plot_table.Group = categorical(grouping_data);
+p = parallelplot(plot_table, 'GroupVariable', 'Group');
+p.LineStyle = {':', '-'};
+p.Color = [ [0.8 0.8 0.8] ; red_color ];
+p.LineWidth = [1, 1.5];
+title('MSCC 최적화 탐색 결과 분석 (병렬 좌표 플롯)');
+
+%% 그림 3: 안전/성공 영역 시각화 (3D 산점도 - 모든 조합)
+idx_success = all_costs < 10000;
+idx_fail_safety = all_costs >= 20000;
+% --- 조합 1: C-rate 1, 2, 3 ---
+figure(202); hold on; % Figure 번호 중복 방지
+if any(idx_fail_safety), scatter3(all_C_rates(idx_fail_safety, 1), all_C_rates(idx_fail_safety, 2), all_C_rates(idx_fail_safety, 3), 30, red_color, 'x', 'DisplayName', '실패'); end
+if any(idx_success), scatter3(all_C_rates(idx_success, 1), all_C_rates(idx_success, 2), all_C_rates(idx_success, 3), 50, blue_color, 'o', 'filled', 'DisplayName', '성공'); end
+scatter3(optimal_C_mscc(1), optimal_C_mscc(2), optimal_C_mscc(3), 200, 'k', '*', 'LineWidth', 2, 'DisplayName', '최적해');
+hold off; title('탐색 공간 (C-rate 1-2-3)'); xlabel('C-rate 1'); ylabel('C-rate 2'); zlabel('C-rate 3'); legend; grid on; view(3); set(gca, 'FontSize', 12);
+% --- 조합 2: C-rate 1, 2, 4 ---
+figure(203); hold on; % Figure 번호 중복 방지
+if any(idx_fail_safety), scatter3(all_C_rates(idx_fail_safety, 1), all_C_rates(idx_fail_safety, 2), all_C_rates(idx_fail_safety, 4), 30, red_color, 'x', 'DisplayName', '실패'); end
+if any(idx_success), scatter3(all_C_rates(idx_success, 1), all_C_rates(idx_success, 2), all_C_rates(idx_success, 4), 50, blue_color, 'o', 'filled', 'DisplayName', '성공'); end
+scatter3(optimal_C_mscc(1), optimal_C_mscc(2), optimal_C_mscc(4), 200, 'k', '*', 'LineWidth', 2, 'DisplayName', '최적해');
+hold off; title('탐색 공간 (C-rate 1-2-4)'); xlabel('C-rate 1'); ylabel('C-rate 2'); zlabel('C-rate 4'); legend; grid on; view(3); set(gca, 'FontSize', 12);
+% --- 조합 3: C-rate 1, 3, 4 ---
+figure(204); hold on; % Figure 번호 중복 방지
+if any(idx_fail_safety), scatter3(all_C_rates(idx_fail_safety, 1), all_C_rates(idx_fail_safety, 3), all_C_rates(idx_fail_safety, 4), 30, red_color, 'x', 'DisplayName', '실패'); end
+if any(idx_success), scatter3(all_C_rates(idx_success, 1), all_C_rates(idx_success, 3), all_C_rates(idx_success, 4), 50, blue_color, 'o', 'filled', 'DisplayName', '성공'); end
+scatter3(optimal_C_mscc(1), optimal_C_mscc(3), optimal_C_mscc(4), 200, 'k', '*', 'LineWidth', 2, 'DisplayName', '최적해');
+hold off; title('탐색 공간 (C-rate 1-3-4)'); xlabel('C-rate 1'); ylabel('C-rate 3'); zlabel('C-rate 4'); legend; grid on; view(3); set(gca, 'FontSize', 12);
+% --- 조합 4: C-rate 2, 3, 4 ---
+figure(205); hold on; % Figure 번호 중복 방지
+if any(idx_fail_safety), scatter3(all_C_rates(idx_fail_safety, 2), all_C_rates(idx_fail_safety, 3), all_C_rates(idx_fail_safety, 4), 30, red_color, 'x', 'DisplayName', '실패'); end
+if any(idx_success), scatter3(all_C_rates(idx_success, 2), all_C_rates(idx_success, 3), all_C_rates(idx_success, 4), 50, blue_color, 'o', 'filled', 'DisplayName', '성공'); end
+scatter3(optimal_C_mscc(2), optimal_C_mscc(3), optimal_C_mscc(4), 200, 'k', '*', 'LineWidth', 2, 'DisplayName', '최적해');
+hold off; title('탐색 공간 (C-rate 2-3-4)'); xlabel('C-rate 2'); ylabel('C-rate 3'); zlabel('C-rate 4'); legend; grid on; view(3); set(gca, 'FontSize', 12);
+
+%% 그림 4: 성능-안전 교환관계 분석 (Trade-off Plot)
+if exist('mscc_optimization_log.csv', 'file')
+    log_data = readmatrix('mscc_optimization_log.csv');
+    if ~isempty(log_data)
+        figure(206); % Figure 번호 중복 방지
+        scatter(log_data(:,5), log_data(:,6), 50, 'filled', 'Color', blue_color);
+        xlabel('충전 시간 (초)'); ylabel('최소 과전압 (V)');
+        title('성능-안전 교환관계 (Trade-off)');
+        grid on; set(gca, 'FontSize', 12);
+    end
+else
+    disp('Trade-off 플롯을 위한 로그 파일(mscc_optimization_log.csv)이 없습니다.');
+end
+disp('모든 분석 및 시각화가 완료되었습니다.'); 
+
+% =========================================================================
+% PART 7: 결과 변수 저장
+% =========================================================================
+%%
+disp('모든 결과 변수를 MAT 파일에 저장합니다...');
+date_string = datestr(now, 'yyyymmdd');
+save_filename = ['Optimization_Results_3-Stage_' date_string '.mat'];
+vars_to_save = {
+    'optimal_C_rate', 'cccv_min_time', 'trials_cccv', ...
+    'optimal_C_mscc', 'mscc_min_time', 'trials_mscc', ...
+    'optimal_pulse_params', 'min_time_with_pulse', 'trials_pulse', ...
+    'time_cccv_charging', 'V_diff_cccv_charging', 'SOC_cccv_charging', 'E_cell_cccv_charging', 'I_cell_cccv_charging', ...
+    'time_mscc_charging', 'V_diff_mscc_charging', 'SOC_mscc_charging', 'E_cell_mscc_charging', 'I_cell_mscc_charging', ...
+    'time_pulse_charging', 'V_diff_pulse_charging', 'SOC_pulse_charging', 'E_cell_pulse_charging', 'I_cell_pulse_charging'
+};
+save(save_filename, vars_to_save{:});
+fprintf('결과 저장이 완료되었습니다: %s\n', save_filename);
+
+% =========================================================================
+% ===== 로컬 함수 (Local Functions) =====
+% =========================================================================
+function cost = evaluate_cccv(C_rate, model)
+    persistent f_count; if isempty(f_count), f_count = 0; end; f_count = f_count + 1;
+    fprintf('\n[CCCV F-count: %d] 시도 C-rate: %.2f C\n', f_count, C_rate);
+    try
+        model.param.set('C_rate', num2str(C_rate));
+        model.study('std1').run();
+        expressions = {'t', 'phis-phil', 'liion.cdc1.CC_CH', 'liion.cdc1.CV_CH'};
+        data = mpheval(model, expressions, 'dataset', 'dset1', 'edim', 'point', 'selection', 2, 'solnum', 'all');
+        time_vec = data.d1; V_diff_vec = data.d2; charge_flag = data.d3; cv_flag = data.d4;
+        charge_indices = (charge_flag == 1) | (cv_flag == 1);
+        time_charging = time_vec(charge_indices);
+        if isempty(time_charging), cost = 99999; disp('결과: 충전 데이터 없음. 페널티.'); return; end
+        V_diff_charging = V_diff_vec(charge_indices);
+        min_V_diff = min(V_diff_charging);
+        if min_V_diff <= 0, cost = 20000 - min_V_diff*1e6; disp(['결과: 안전 페널티. min(phis-phil) = ' num2str(min_V_diff, '%.4f') 'V <= 0V']); return; end
+        cost = time_charging(end);
+        fprintf('결과: 성공! 충전 시간: %.2f 초\n', cost);
+    catch
+        cost = 99999; disp('결과: 시뮬레이션 오류. 페널티.');
+    end
+end
+
+function cost = evaluate_mscc(C, model)
+    persistent f_count; if isempty(f_count), f_count = 0; end; f_count = f_count + 1;
+    fprintf('\n[MSCC F-count: %d] 시도 C-rates: C1=%.2f, C2=%.2f, C3=%.2f, C4=%.2f\n', C(1), C(2), C(3), C(4));
+    try
+        model.param.set('first_MSCC_Crate', num2str(C(1)));
+        model.param.set('second_MSCC_Crate', num2str(C(2)));
+        model.param.set('third_MSCC_Crate', num2str(C(3)));
+        model.param.set('fourth_MSCC_Crate', num2str(C(4)));
+        model.study('std2').run();
+        expressions = {'t', 'phis-phil', 'liion.cdc1.CC_CH', 'liion.cdc1.CV_CH'};
+        data = mpheval(model, expressions, 'dataset', 'dset3', 'edim', 'point', 'selection', 2, 'solnum', 'all');
+        time_vec = data.d1; V_diff_vec = data.d2; charge_flag = data.d3; cv_flag = data.d4;
+        charge_indices = (charge_flag == 1) | (cv_flag == 1);
+        time_charging = time_vec(charge_indices);
+        if isempty(time_charging), cost = 99999; disp('결과: 충전 데이터 없음. 페널티.'); return; end
+        V_diff_charging = V_diff_vec(charge_indices);
+        min_V_diff = min(V_diff_charging);
+        if min_V_diff <= 0, cost = 20000 - min_V_diff*1e6; disp(['결과: 안전 페널티. min(phis-phil) = ' num2str(min_V_diff, '%.4f') 'V <= 0V']); return; end
+        cost = time_charging(end);
+        fprintf('결과: 성공! 충전 시간: %.2f 초, 최소 과전압: %.4f V\n', cost, min_V_diff);
+        writematrix([C, cost, min_V_diff], 'mscc_optimization_log.csv', 'WriteMode', 'append');
+    catch
+        cost = 99999; disp('결과: 시뮬레이션 오류. 페널티.');
+    end
+end
+
+function cost = evaluate_pulse_insertion(X_pulse, model, baseline_mscc_crates)
+    persistent f_count_pulse; if isempty(f_count_pulse), f_count_pulse = 0; end; f_count_pulse = f_count_pulse + 1;
+    
+    Pulse_Start_SOC_val = X_pulse(1);
+    Pulse_Duration_SOC_val = X_pulse(2);
+    Pulse_Rest_Coeff_val = X_pulse(3);
+    Pulse_Period_val = X_pulse(4);
+    Duty_Cycle_val = X_pulse(5);
+
+    fprintf('\n[Pulse F-count: %d] 시도 펄스: SOC=%.1f-%.1f, RestCoeff=%.2f, Period=%.1fs, Duty=%.1f%%\n', ...
+        f_count_pulse, Pulse_Start_SOC_val, Pulse_Start_SOC_val + Pulse_Duration_SOC_val, Pulse_Rest_Coeff_val, Pulse_Period_val, Duty_Cycle_val);
+
+    try
+        model.param.set('first_MSCC_Crate', num2str(baseline_mscc_crates(1)));
+        model.param.set('second_MSCC_Crate', num2str(baseline_mscc_crates(2)));
+        model.param.set('third_MSCC_Crate', num2str(baseline_mscc_crates(3)));
+        model.param.set('fourth_MSCC_Crate', num2str(baseline_mscc_crates(4)));
+        
+        model.param.set('pulse_start_soc_param', num2str(Pulse_Start_SOC_val));
+        model.param.set('pulse_duration_soc_param', num2str(Pulse_Duration_SOC_val));
+        model.param.set('pulse_rest_current_param_coeffi', num2str(Pulse_Rest_Coeff_val));
+        model.param.set('pulse_freq', [num2str(1/Pulse_Period_val) '[Hz]']); % 주기로 변환
+        model.param.set('duty_cycle', num2str(Duty_Cycle_val/100)); % 0-1 사이 값으로
+        
+        model.study('std3').run();
+        
+        expressions = {'t', 'phis-phil', 'liion.cdc1.CC_CH', 'liion.cdc1.CV_CH'};
+        data = mpheval(model, expressions, 'dataset', 'dset37', 'edim', 'point', 'selection', 2, 'solnum', 'all');
+        time_vec = data.d1; V_diff_vec = data.d2; charge_flag = data.d3; cv_flag = data.d4;
+        charge_indices = (charge_flag == 1) | (cv_flag == 1);
+        time_charging = time_vec(charge_indices);
+        if isempty(time_charging), cost = 99999; disp('결과: 충전 데이터 없음. 페널티.'); return; end
+        
+        V_diff_charging = V_diff_vec(charge_indices);
+        min_V_diff = min(V_diff_charging);
+        if min_V_diff <= 0, cost = 20000 - min_V_diff*1e6; disp(['결과: 안전 페널티. min(phis-phil) = ' num2str(min_V_diff, '%.4f') 'V <= 0V']); return; end
+        
+        cost = time_charging(end);
+        fprintf('결과: 성공! 충전 시간: %.2f 초\n', cost);
+        writematrix([X_pulse, cost, min_V_diff], 'pulse_optimization_log.csv', 'WriteMode', 'append');
+
+    catch
+        cost = 99999;
+        disp('결과: 시뮬레이션 오류. 페널티.');
+    end
+end
