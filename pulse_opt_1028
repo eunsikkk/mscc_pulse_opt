@@ -1,37 +1,58 @@
 % =========================================================================
 % COMSOL-MATLAB: MSCC+Pulse 전용 최적화 (C1,C2=6C 고정, 6개 변수 탐색)
+%   - 로그 CSV: pulse_mscc_optimization_log_YYYYMMDD_HHMMSS.csv
+%       [C3 C4 SOC_start SOC_duration I_rest pulse_period_s duty T_s min_overpot_V T_avg T_max]
+%   - 최적해 시계열: timeseries/MSCC_pulse_opt.csv
+%       t, E_cell, I_cell, SOC, phis_minus_phil, CC_flag, CV_flag, T_avg, T_max
+%   - 요약 MAT: run_summary_YYYYMMDD_HHMMSS.mat
+%       opt_x, fval, exitflag, output, trials, safety_eps, N_EVALS, lb, ub, 파일경로 등
 % =========================================================================
 clc; clear; close all;
 import com.comsol.model.*
 import com.comsol.model.util.*
 
-%% 0) 모델 로드 & 기본 설정 -------------------------------------------------
-filepath = 'C:\Users\dsdsd\Downloads';
-filename = 'ES_MSCC_PC_1022_feedback_ver (1).mph';   % 콤솔 모델: pulse_freq은 "period[s]" 단위
+%% 0) 경로/출력 폴더 및 모델 -------------------------------------------------
+% --- 출력 베이스 디렉토리 (원하는 경로로 바꾸세요)
+base_dir = 'G:\공유 드라이브\Battery Software Group (2025)\Members\최은식\COMSOL\MSCC_optimization\MSCC_CCCV_opt';
+assert(isfolder(base_dir), '기본 폴더 없음: %s', base_dir);
+
+ts = datestr(now,'yyyymmdd_HHMMSS');
+out_dir = fullfile(base_dir, ['run_' ts]);
+ts_dir  = fullfile(out_dir, 'timeseries');
+if ~isfolder(out_dir), mkdir(out_dir); end
+if ~isfolder(ts_dir),  mkdir(ts_dir);  end
+
+% --- 모델 경로
+filepath = 'C:\Users\user\Downloads';
+filename = 'ES_MSCC_PC_1028_feedback_ver.mph';   % NOTE: pulse_freq는 "period [s]" 파라미터임
 full_path = fullfile(filepath, filename);
 assert(isfile(full_path), 'mph 파일이 없습니다: %s', full_path);
 
+% --- 모델 로드
 model = mphload(full_path);
 ModelUtil.showProgress(true);
 disp('모델 불러오기 완료.');
 
-% 로그 파일 초기화
-log_csv = 'pulse_mscc_optimization_log.csv';
-if exist(log_csv,'file'), delete(log_csv); end
-writematrix(["C3","C4","SOC_start","SOC_duration","I_rest","pulse_period_s","duty","T_s","min_overpot_V"], log_csv);
+%% 1) 로그 파일 준비 ---------------------------------------------------------
+fn_pulse = fullfile(out_dir, ['pulse_mscc_optimization_log_' ts '.csv']);
+hdr = ["C3","C4","SOC_start","SOC_duration","I_rest","pulse_period_s","duty","T_s","min_overpot_V","T_avg","T_max"];
+writematrix(hdr, fn_pulse);  % 헤더 저장
 
-%% 1) 최적화 변수/경계 -------------------------------------------------------
+%% 2) 최적화 변수/경계 & 옵션 ------------------------------------------------
 % x = [C3, C4, SOC_start, SOC_duration, I_rest, pulse_period_s]
 lb = [ 0.5, 0.5, 0.50, 0.05, -0.2,  10 ];
-ub = [ 3.0, 3.0, 0.80, 0.30,  0.2, 300 ];
+ub = [ 4.0, 4.0, 0.80, 0.30,  0.2, 100 ];
+
+N_EVALS = 100;           % surrogateopt 예산
+safety_eps = 0.05;       % [V] 최소 과전압 임계
 
 opts = optimoptions('surrogateopt', ...
-    'MaxFunctionEvaluations', 2, ...
+    'MaxFunctionEvaluations', N_EVALS, ...
     'Display','iter', ...
     'PlotFcn','surrogateoptplot');
 
-%% 2) 목적함수 ---------------------------------------------------------------
-obj = @(x) evaluate_pulse_mscc_only(x, model, log_csv);
+%% 3) 목적함수 ---------------------------------------------------------------
+obj = @(x) evaluate_pulse_mscc_only(x, model, fn_pulse, safety_eps);
 
 [opt_x, fval, exitflag, output, trials] = surrogateopt(obj, lb, ub, opts);
 
@@ -44,96 +65,204 @@ fprintf('pulse_period = %.1f s\n', opt_x(6));
 fprintf('duty_cycle = 0.5 (고정)\n');
 fprintf('충전 시간(목적값) T = %.2f s\n', fval);
 
-%% 3) 최적 해로 한 번 더 시뮬레이션 & 시계열 확보 ---------------------------
-set_params_for_run(model, opt_x);
-model.study('std3').run();
+%% 4) 최적해로 한 번 더 시뮬레이션 & 시계열 저장 -----------------------------
+% (파라미터 직접 세팅 후 std3 실행)
+C3 = opt_x(1); C4 = opt_x(2); s0 = opt_x(3); sd = opt_x(4); Irest = opt_x(5); Tper = opt_x(6);
+model.param.set('first_MSCC_Crate','6');
+model.param.set('second_MSCC_Crate','6');
+model.param.set('third_MSCC_Crate', num2str(C3));
+model.param.set('fourth_MSCC_Crate',num2str(C4));
+model.param.set('pulse_start_soc_param',           num2str(s0));
+model.param.set('pulse_duration_soc_param',        num2str(sd));
+model.param.set('pulse_rest_current_param_coeffi', num2str(Irest));
+model.param.set('pulse_freq', [num2str(Tper) '[s]']);   % period 그대로
+model.param.set('duty_cycle', '0.5');
 
-expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil','liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
-data = mpheval(model, expr, 'dataset','dset37', 'edim','point','selection',2,'solnum','all');
+% 실행 (1회 실패 시 1회 재시도)
+if ~try_run_study(model, 'std3')
+    fprintf('최적해 재실행 실패(1차). 재시도...\n');
+    ok2 = try_run_study(model, 'std3');
+    if ~ok2, error('최적해 재실행 실패'); end
+end
 
-t = data.d1; V = data.d2; I = data.d3; SOC = data.d4; over = data.d5; cc = data.d6; cv = data.d7;
+% 시계열 취득 (T_avg/T_max 포함)
+expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil','liion.cdc1.CC_CH','liion.cdc1.CV_CH','T_avg','T_max'};
+D = mpheval(model, expr, 'dataset','dset37', 'edim','point','selection',2,'solnum','all');
+
+t = D.d1; V = D.d2; I = D.d3; SOC = D.d4; over = D.d5; cc = D.d6; cv = D.d7;
+Tavg_ts = toColSafe(D,8);  Tmax_ts = toColSafe(D,9);
+
 idx = (cc==1) | (cv==1);
 T_final = t(find(idx,1,'last'));
 fprintf('재실행 완료: 최종 충전시간 T = %.2f s\n', T_final);
 
-TBL = table(t(idx), V(idx), I(idx), SOC(idx), over(idx), cc(idx), cv(idx), ...
-    'VariableNames',{'t','E_cell','I_cell','SOC','phis_minus_phil','CC_flag','CV_flag'});
-writetable(TBL, 'MSCC_pulse_opt_timeseries.csv');
-disp('MSCC_pulse_opt_timeseries.csv 저장 완료.');
+opt_csv = fullfile(ts_dir, 'MSCC_pulse_opt.csv');
+TBL = table(t(idx), V(idx), I(idx), SOC(idx), over(idx), cc(idx), cv(idx), Tavg_ts(idx), Tmax_ts(idx), ...
+    'VariableNames',{'t','E_cell','I_cell','SOC','phis_minus_phil','CC_flag','CV_flag','T_avg','T_max'});
+writetable(TBL, opt_csv);
+fprintf('OPT 시계열 저장: %s\n', opt_csv);
+
+%% 5) 요약 MAT 저장 ----------------------------------------------------------
+save(fullfile(out_dir, ['run_summary_' ts '.mat']), ...
+    'opt_x','fval','exitflag','output','trials', ...
+    'safety_eps','N_EVALS','lb','ub', ...
+    'fn_pulse','opt_csv','full_path','out_dir','ts_dir');
+
+fprintf('요약 MAT 저장 완료.\n출력 폴더: %s\n', out_dir);
 
 %% =================== Local Functions =====================================
-function cost = evaluate_pulse_mscc_only(x, model, log_csv)
+function cost = evaluate_pulse_mscc_only(x, model, log_csv, safety_eps)
     % x = [C3, C4, SOC_start, SOC_duration, I_rest, pulse_period_s]
     persistent f_count
     if isempty(f_count), f_count = 0; end
     f_count = f_count + 1;
 
-    C3 = x(1); 
+    % -------- 파라미터 해제 --------
+    C3 = x(1);
     C4 = x(2);
-    s0 = x(3); 
-    sd = x(4); 
+    s0 = x(3);
+    sd = x(4);
     s1 = s0 + sd;
-    Irest = x(5); 
-    Tper = x(6); 
+    Irest = x(5);
+    Tper = x(6);
     duty = 0.5;
 
-    % ==== 진행중인 시도 및 파라미터 표시 ====
+    % -------- 페널티 상수 --------
+    PENALTY_HARD = 1e9; % 하드 컷(유효성 위반 등)
+    PENALTY_SOFT = 1e8; % 실행 실패/데이터 없음
+    PENALTY_SAFE = 2e7; % 안전 위반 기준점
+
+    % ---- 진행중 파라미터 표시 ----
     fprintf('\n[Pulse-MSCC F-count %03d]  ', f_count);
     fprintf('C3=%.3f C, C4=%.3f C, SOC_start=%.3f, SOC_dur=%.3f, end=%.3f, I_rest=%.3f C, period=%.1f s\n', ...
         C3, C4, s0, sd, s1, Irest, Tper);
 
-    % ==== 유효성 검증 ====
+    % ---- 유효성 검증(하드 컷) ----
+    if ~isfinite(C3) || ~isfinite(C4) || ~isfinite(s0) || ~isfinite(sd) || ~isfinite(Irest) || ~isfinite(Tper)
+        fprintf(' → NaN/Inf 파라미터 → 하드 페널티\n');
+        cost = PENALTY_HARD; return;
+    end
     if s1 > 0.898 || s1 <= s0
-        fprintf(' → 무효 SOC 영역 (%.3f ~ %.3f) → 페널티\n', s0, s1);
-        cost = 1e9;
+        fprintf(' → 무효 SOC 영역 (%.3f ~ %.3f) → 하드 페널티\n', s0, s1);
+        cost = PENALTY_HARD; return;
+    end
+    if Tper <= 0
+        fprintf(' → period<=0 → 하드 페널티\n');
+        cost = PENALTY_HARD; return;
+    end
+
+    % ---- 파라미터 세팅 ----
+    try
+        model.param.set('first_MSCC_Crate','6');
+        model.param.set('second_MSCC_Crate','6');
+        model.param.set('third_MSCC_Crate', num2str(C3));
+        model.param.set('fourth_MSCC_Crate',num2str(C4));
+        model.param.set('pulse_start_soc_param',           num2str(s0));
+        model.param.set('pulse_duration_soc_param',        num2str(sd));
+        model.param.set('pulse_rest_current_param_coeffi', num2str(Irest));
+        model.param.set('pulse_freq', [num2str(Tper) '[s]']);   % period 그대로
+        model.param.set('duty_cycle', '0.5');                   % 50% 고정
+    catch ME
+        fprintf(' → 파라미터 세팅 실패: %s → 하드 페널티\n', ME.message);
+        cost = PENALTY_HARD; return;
+    end
+
+    % ---- 실행(1회 + 실패 시 1회 재시도) ----
+    ran = try_run_study(model, 'std3');
+    if ~ran
+        fprintf(' → 실행 실패(1차). 재시도...\n');
+        ran = try_run_study(model, 'std3');
+    end
+    if ~ran
+        fprintf(' → 실행 실패(재시도도 실패) → 소프트 페널티\n');
+        cost = PENALTY_SOFT; return;
+    end
+
+    % ---- 결과 평가(안전하게) ----
+    [ok, D] = try_mpheval(model, ...
+        {'t','phis-phil','liion.cdc1.CC_CH','liion.cdc1.CV_CH'}, ...
+        'dset37');
+    if ~ok
+        fprintf(' → mpheval 실패 → 소프트 페널티\n');
+        cost = PENALTY_SOFT; return;
+    end
+
+    t = D.d1; over = D.d2; cc = D.d3; cv = D.d4;
+    idx = (cc==1) | (cv==1);
+    if ~any(idx)
+        fprintf(' → 충전구간 없음 → 소프트 페널티\n');
+        cost = PENALTY_SOFT; return;
+    end
+
+    Tmin = min(over(idx));
+    if ~isfinite(Tmin) || Tmin <= safety_eps
+        fprintf(' → 안전 위반 (min over = %.4f V ≤ %.3f V) → 페널티\n', Tmin, safety_eps);
+        cost = PENALTY_SAFE + 1e6*(safety_eps - Tmin); % 위반량만큼 가중
+        % 그래도 로그는 남긴다: T_avg/T_max도 시도해봄
+        [Tavg_val, Tmax_val] = get_temp_peaks(model, 'dset37');
+        safe_write_row(log_csv, [C3, C4, s0, sd, Irest, Tper, duty, NaN, Tmin, Tavg_val, Tmax_val]);
         return;
     end
 
+    % 유효 → 시간/온도 산출
+    Tcharge = t(find(idx,1,'last'));
+    [Tavg_val, Tmax_val] = get_temp_peaks(model, 'dset37');
+    cost = Tcharge;
+
+    fprintf(' → 성공 | 충전시간 = %.2f s, min(phis-phil)=%.4f V, Tavg=%.2f, Tmax=%.2f\n', ...
+        Tcharge, Tmin, Tavg_val, Tmax_val);
+
+    % 로그 저장
+    safe_write_row(log_csv, [C3, C4, s0, sd, Irest, Tper, duty, Tcharge, Tmin, Tavg_val, Tmax_val]);
+end
+
+% ---------- 헬퍼: 안전 실행용 study.run ----------
+function ok = try_run_study(model, study_id)
+    ok = true;
     try
-        % MSCC Crate 설정 (C1,C2=6 고정)
-        model.param.set('first_MSCC_Crate','6');
-        model.param.set('second_MSCC_Crate','6');
-        model.param.set('third_MSCC_Crate',num2str(C3));
-        model.param.set('fourth_MSCC_Crate',num2str(C4));
+        model.study(study_id).run();
+    catch
+        ok = false;
+    end
+end
 
-        % Pulse 파라미터 설정
-        model.param.set('pulse_start_soc_param',num2str(s0));
-        model.param.set('pulse_duration_soc_param',num2str(sd));
-        model.param.set('pulse_rest_current_param_coeffi',num2str(Irest));
-        model.param.set('pulse_freq',[num2str(Tper) '[s]']); % period 그대로
-        model.param.set('duty_cycle','0.5');
+% ---------- 헬퍼: 안전 실행용 mpheval ----------
+function [ok, D] = try_mpheval(model, exprs, dset)
+    ok = true; D = struct();
+    try
+        D = mpheval(model, exprs, 'dataset', dset, 'edim','point', 'selection',2, 'solnum','all');
+    catch
+        ok = false;
+    end
+end
 
-        % 실행
-        model.study('std3').run();
+% ---------- 헬퍼: T_avg/T_max 피크값 취득 ----------
+function [Tavg_peak, Tmax_peak] = get_temp_peaks(model, dset)
+    Tavg_peak = NaN; Tmax_peak = NaN;
+    try
+        G = mpheval(model, 'T_avg', 'dataset', dset, 'edim','domain', 'solnum','all');
+        Tavg_peak = max(G.d1(:), [], 'omitnan');
+    catch
+    end
+    try
+        G = mpheval(model, 'T_max', 'dataset', dset, 'edim','domain', 'solnum','all');
+        Tmax_peak = max(G.d1(:), [], 'omitnan');
+    catch
+    end
+end
 
-        % 결과 평가
-        expr = {'t','phis-phil','liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
-        D = mpheval(model,expr,'dataset','dset37','edim','point','selection',2,'solnum','all');
-        t = D.d1; over = D.d2; cc = D.d3; cv = D.d4;
-        idx = (cc==1)|(cv==1);
+% ---------- 헬퍼: 시계열 컬럼 안전 취득 ----------
+function col = toColSafe(data, idx)
+    try, col = data.(['d' num2str(idx)]);
+    catch, col = nan(size(data.d1));
+    end
+end
 
-        if ~any(idx)
-            fprintf(' → 충전구간 없음 → 페널티\n');
-            cost = 1e8;
-            return;
-        end
-
-        Tmin = min(over(idx));
-        if Tmin <= 0
-            fprintf(' → 안전 위반 (min over = %.4f V) → 페널티\n', Tmin);
-            cost = 2e7 - 1e6*Tmin;
-            return;
-        end
-
-        Tcharge = t(find(idx,1,'last'));
-        cost = Tcharge;
-
-        fprintf(' → 성공 | 충전시간 = %.2f s, min(phis-phil)=%.4f V\n', Tcharge, Tmin);
-
-        writematrix([C3, C4, s0, sd, Irest, Tper, duty, Tcharge, Tmin], log_csv, 'WriteMode','append');
-
+% ---------- 헬퍼: 로그 안전 기록 ----------
+function safe_write_row(fn, row)
+    try
+        writematrix(row, fn, 'WriteMode','append');
     catch ME
-        fprintf(' → 오류 발생: %s → 페널티\n', ME.message);
-        cost = 1e8;
+        fprintf(' → 로그 저장 실패(무시): %s\n', ME.message);
     end
 end
