@@ -1,0 +1,296 @@
+% =========================================================================
+% COMSOL-MATLAB: Unified Optimization (CCCV, MSCC-4step, MSCC-2step)
+%  - 공통 설정: safety_eps(최소 과전압 임계), N_EVALS(평가 횟수) 한번에 조정
+%  - 각 프로토콜별 로그 CSV + 요약 MAT 저장 (타임시리즈 저장/추가 run 제거)
+%  - 시간은 소문자 t, 온도는 대문자 T 표기
+%  - t80 완전 제거
+% =========================================================================
+clc; clear; close all;
+import com.comsol.model.*
+import com.comsol.model.util.*
+
+%% 0) 공통 조절 파라미터 (세 프로토콜에 동시에 적용)
+safety_eps = 0.05;    % [V]  min(phis-phil) > safety_eps 이어야 안전
+N_EVALS    = 1000;       % surrogateopt MaxFunctionEvaluations (세 프로토콜 공통)
+
+%% 1) 경로/출력 폴더
+base_dir = 'G:\공유 드라이브\Battery Software Group (2025)\Members\최은식\COMSOL\MSCC_optimization\MSCC_CCCV_opt';
+assert(isfolder(base_dir), '기본 폴더가 없습니다: %s', base_dir);
+ts = datestr(now,'yyyymmdd_HHMMSS');
+out_dir = fullfile(base_dir, ['run_' ts]);
+ts_dir  = fullfile(out_dir, 'timeseries');     %#ok<NASGU> % (사용 안 함, 하위 섹션 제거)
+if ~isfolder(out_dir), mkdir(out_dir); end
+
+fn_cccv  = fullfile(out_dir, ['cccv_optimization_log_'  ts '.csv']);
+fn_mscc4 = fullfile(out_dir, ['mscc4_optimization_log_' ts '.csv']);
+fn_mscc2 = fullfile(out_dir, ['mscc2_optimization_log_' ts '.csv']);
+
+%% 2) 모델 로드
+filepath = 'C:\Users\user\Downloads';
+filename = 'ES_MSCC_PC_1028_feedback_ver.mph';   % std1/dset1, std2/dset3 포함 모델
+full_path = fullfile(filepath, filename);
+assert(isfile(full_path),'mph 파일 없음: %s', full_path);
+
+model = mphload(full_path);
+ModelUtil.showProgress(true);
+disp('모델 불러오기 완료.');
+
+%% 3) 로그 헤더 생성  (t80 제거, 시간은 't', 온도는 'T_*')
+% CCCV  : [C, t, s, cv_frac, E_Wh, Vdiff_min, Vdiff_max, T_avg, T_max]
+if ~isfile(fn_cccv)
+    T = table('Size',[0 9], 'VariableTypes', repmat({'double'},1,9), ...
+        'VariableNames', {'C','t','s','cv_frac','E_Wh','Vdiff_min','Vdiff_max','T_avg','T_max'});
+    writetable(T, fn_cccv);
+end
+% MSCC4 : [C1 C2 C3 C4, t, s, cv_frac, E_Wh, Vdiff_min, Vdiff_max, T_avg, T_max]
+if ~isfile(fn_mscc4)
+    T = table('Size',[0 12], 'VariableTypes', repmat({'double'},1,12), ...
+        'VariableNames', {'C1','C2','C3','C4','t','s','cv_frac','E_Wh','Vdiff_min','Vdiff_max','T_avg','T_max'});
+    writetable(T, fn_mscc4);
+end
+% MSCC2 : [C12 C34, t, s, cv_frac, E_Wh, Vdiff_min, Vdiff_max, T_avg, T_max]
+if ~isfile(fn_mscc2)
+    T = table('Size',[0 10], 'VariableTypes', repmat({'double'},1,10), ...
+        'VariableNames', {'C12','C34','t','s','cv_frac','E_Wh','Vdiff_min','Vdiff_max','T_avg','T_max'});
+    writetable(T, fn_mscc2);
+end
+
+%% 4) 최적화: CCCV ----------------------------------------------------------
+disp('===== CCCV 최적화를 시작합니다 =====');
+lb_cccv = 0.1;  ub_cccv = 6.0;
+obj_cccv = @(C) evaluate_and_log_CCCV(C, model, safety_eps, fn_cccv);
+
+opts_cccv = optimoptions('surrogateopt', ...
+    'MaxFunctionEvaluations', N_EVALS, ...
+    'Display','iter', 'PlotFcn','surrogateoptplot');
+
+[optimal_C_rate, cccv_min_t, exitflag_cccv, output_cccv, trials_cccv] = ...
+    surrogateopt(obj_cccv, lb_cccv, ub_cccv, opts_cccv);
+
+fprintf('\n--- CCCV 최적화 결과 ---\n');
+fprintf('최적 충전시간 t = %.2f s, 최적 C = %.3f C\n\n', cccv_min_t, optimal_C_rate);
+
+%% 5) 최적화: MSCC (4-step) -------------------------------------------------
+disp('===== MSCC (4-step) 최적화를 시작합니다 =====');
+lb_mscc4 = [0.1 0.1 0.1 0.1];
+ub_mscc4 = [6.0 6.0 6.0 6.0];
+obj_mscc4 = @(C) evaluate_and_log_MSCC4(C, model, safety_eps, fn_mscc4);
+
+opts_mscc4 = optimoptions('surrogateopt', ...
+    'MaxFunctionEvaluations', N_EVALS, ...
+    'Display','iter', 'PlotFcn','surrogateoptplot');
+
+[optimal_C_mscc4, mscc4_min_t, exitflag_mscc4, output_mscc4, trials_mscc4] = ...
+    surrogateopt(obj_mscc4, lb_mscc4, ub_mscc4, opts_mscc4);
+
+fprintf('\n--- MSCC (4-step) 최적화 결과 ---\n');
+fprintf('최적 충전시간 t = %.2f s, 최적 C = [%.3f %.3f %.3f %.3f]\n\n', mscc4_min_t, optimal_C_mscc4);
+
+%% 6) 최적화: MSCC (2-step) -------------------------------------------------
+disp('===== MSCC (2-step) 최적화를 시작합니다 =====');
+% 의사결정변수: C12, C34  (실제 세팅은 [C12 C12 C34 C34])
+lb_mscc2 = [0.1 0.1];
+ub_mscc2 = [6.0 6.0];
+obj_mscc2 = @(Cx) evaluate_and_log_MSCC2(Cx, model, safety_eps, fn_mscc2);
+
+opts_mscc2 = optimoptions('surrogateopt', ...
+    'MaxFunctionEvaluations', N_EVALS, ...
+    'Display','iter', 'PlotFcn','surrogateoptplot');
+
+[optimal_C_mscc2, mscc2_min_t, exitflag_mscc2, output_mscc2, trials_mscc2] = ...
+    surrogateopt(obj_mscc2, lb_mscc2, ub_mscc2, opts_mscc2);
+
+fprintf('\n--- MSCC (2-step) 최적화 결과 ---\n');
+fprintf('최적 충전시간 t = %.2f s, 최적 [C12 C34] = [%.3f %.3f]\n\n', mscc2_min_t, optimal_C_mscc2);
+
+%% 7) (삭제됨) 최적해 타임시리즈 저장 --------------------------------------
+% >>> 기존 dump_timeseries_* 호출과 내부의 추가 run() 전부 제거됨 <<<
+
+%% 8) 요약 MAT 저장 (추가 run 없이 메타 정보만 저장) ------------------------
+save(fullfile(out_dir, ['run_summary_' ts '.mat']), ...
+    'safety_eps','N_EVALS','full_path','out_dir','ts_dir', ...
+    'optimal_C_rate','cccv_min_t','exitflag_cccv','output_cccv','trials_cccv', ...
+    'optimal_C_mscc4','mscc4_min_t','exitflag_mscc4','output_mscc4','trials_mscc4', ...
+    'optimal_C_mscc2','mscc2_min_t','exitflag_mscc2','output_mscc2','trials_mscc2');
+
+fprintf('CSV/MAT 저장 완료(타임시리즈 저장 없음).\n출력 폴더: %s\n', out_dir);
+
+% ============================ Local Functions =============================
+function cost = evaluate_and_log_CCCV(C_rate, model, safety_eps, fn_csv)
+    persistent f_count_cccv
+    if isempty(f_count_cccv), f_count_cccv = 0; end
+    f_count_cccv = f_count_cccv + 1;
+    fprintf('[CCCV  F%04d]  C = %.6g  (%s)\n', f_count_cccv, C_rate, datestr(now,'HH:MM:SS.FFF'));
+
+    PENALTY = 1e9;
+    try
+        model.param.set('C_rate', num2str(C_rate));
+        model.study('std1').run();
+
+        expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil', ...
+                'liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
+        D = mpheval(model, expr, 'dataset','dset1','edim','point','selection',2,'solnum','all');
+        t = D.d1; E = D.d2; I = D.d3; v = D.d5; cc = D.d6; cv = D.d7;
+        idx = (cc==1)|(cv==1);
+
+        [T_avg, T_max] = get_T_peaks(model,'dset1');
+
+        if ~any(idx)
+            append_cccv_row(fn_csv,[C_rate, PENALTY, -inf, nan, nan, nan, nan, T_avg, T_max]);
+            cost = PENALTY; return;
+        end
+
+        tchg = t(idx); Echg = E(idx); Ichg = I(idx); vchg = v(idx); cvchg = cv(idx);
+        t_charge = tchg(end); s = min(vchg);
+        cv_frac = mean(cvchg==1);
+        E_Wh   = trapz(tchg, Echg.*Ichg)/3600;
+        vmin   = min(vchg); vmax = max(vchg);
+
+        if s <= safety_eps
+            cost = PENALTY + (safety_eps - s)*1e6;
+        else
+            cost = t_charge;
+        end
+
+        append_cccv_row(fn_csv,[C_rate, t_charge, s, cv_frac, E_Wh, vmin, vmax, T_avg, T_max]);
+
+    catch ME
+        warning('CCCV 실패(C=%.3g): %s', C_rate, ME.message);
+        append_cccv_row(fn_csv,[C_rate, 1e9, -inf, nan, nan, nan, nan, nan, nan]);
+        cost = 1e9;
+    end
+end
+
+function cost = evaluate_and_log_MSCC4(C, model, safety_eps, fn_csv)
+    persistent f_count_mscc4
+    if isempty(f_count_mscc4), f_count_mscc4 = 0; end
+    f_count_mscc4 = f_count_mscc4 + 1;
+    fprintf('[MSCC4 F%04d]  C = [%.6g %.6g %.6g %.6g]  (%s)\n', ...
+        f_count_mscc4, C(1),C(2),C(3),C(4), datestr(now,'HH:MM:SS.FFF'));
+
+    PENALTY = 1e9;
+    try
+        model.param.set('first_MSCC_Crate',  num2str(C(1)));
+        model.param.set('second_MSCC_Crate', num2str(C(2)));
+        model.param.set('third_MSCC_Crate',  num2str(C(3)));
+        model.param.set('fourth_MSCC_Crate', num2str(C(4)));
+        model.study('std2').run();
+
+        expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil', ...
+                'liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
+        D = mpheval(model, expr, 'dataset','dset3','edim','point','selection',2,'solnum','all');
+        t = D.d1; E = D.d2; I = D.d3; v = D.d5; cc = D.d6; cv = D.d7;
+        idx = (cc==1)|(cv==1);
+
+        [T_avg, T_max] = get_T_peaks(model,'dset3');
+
+        if ~any(idx)
+            append_mscc4_row(fn_csv,[C(:).', PENALTY, -inf, nan, nan, nan, nan, T_avg, T_max]);
+            cost = PENALTY; return;
+        end
+
+        tchg = t(idx); Echg = E(idx); Ichg = I(idx); vchg = v(idx); cvchg = cv(idx);
+        t_charge = tchg(end); s = min(vchg);
+        cv_frac  = mean(cvchg==1);
+        E_Wh     = trapz(tchg, Echg.*Ichg)/3600;
+        vmin     = min(vchg); vmax = max(vchg);
+
+        if s <= safety_eps
+            cost = PENALTY + (safety_eps - s)*1e6;
+        else
+            cost = t_charge;
+        end
+
+        append_mscc4_row(fn_csv,[C(:).', t_charge, s, cv_frac, E_Wh, vmin, vmax, T_avg, T_max]);
+
+    catch ME
+        warning('MSCC4 실패([%g %g %g %g]): %s', C(1),C(2),C(3),C(4), ME.message);
+        append_mscc4_row(fn_csv,[C(:).', 1e9, -inf, nan, nan, nan, nan, nan, nan]);
+        cost = 1e9;
+    end
+end
+
+function cost = evaluate_and_log_MSCC2(Cx, model, safety_eps, fn_csv)
+    % Cx = [C12, C34], 실제 세팅은 [C12 C12 C34 C34]
+    persistent f_count_mscc2
+    if isempty(f_count_mscc2), f_count_mscc2 = 0; end
+    f_count_mscc2 = f_count_mscc2 + 1;
+    C12 = Cx(1); C34 = Cx(2);
+    fprintf('[MSCC2 F%04d]  C12=%.6g, C34=%.6g  (%s)\n', f_count_mscc2, C12, C34, datestr(now,'HH:MM:SS.FFF'));
+
+    PENALTY = 1e9;
+    try
+        model.param.set('first_MSCC_Crate',  num2str(C12));
+        model.param.set('second_MSCC_Crate', num2str(C12));
+        model.param.set('third_MSCC_Crate',  num2str(C34));
+        model.param.set('fourth_MSCC_Crate', num2str(C34));
+        model.study('std2').run();
+
+        expr = {'t','E_cell','liion.cdc1.Icell','SOC','phis-phil', ...
+                'liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
+        D = mpheval(model, expr, 'dataset','dset3','edim','point','selection',2,'solnum','all');
+        t = D.d1; E = D.d2; I = D.d3; v = D.d5; cc = D.d6; cv = D.d7;
+        idx = (cc==1)|(cv==1);
+
+        [T_avg, T_max] = get_T_peaks(model,'dset3');
+
+        if ~any(idx)
+            append_mscc2_row(fn_csv,[C12, C34, PENALTY, -inf, nan, nan, nan, nan, T_avg, T_max]);
+            cost = PENALTY; return;
+        end
+
+        tchg = t(idx); Echg = E(idx); Ichg = I(idx); vchg = v(idx); cvchg = cv(idx);
+        t_charge = tchg(end); s = min(vchg);
+        cv_frac  = mean(cvchg==1);
+        E_Wh     = trapz(tchg, Echg.*Ichg)/3600;
+        vmin     = min(vchg); vmax = max(vchg);
+
+        if s <= safety_eps
+            cost = PENALTY + (safety_eps - s)*1e6;
+        else
+            cost = t_charge;
+        end
+
+        append_mscc2_row(fn_csv,[C12, C34, t_charge, s, cv_frac, E_Wh, vmin, vmax, T_avg, T_max]);
+
+    catch ME
+        warning('MSCC2 실패(C12=%.3g,C34=%.3g): %s', C12, C34, ME.message);
+        append_mscc2_row(fn_csv,[C12, C34, 1e9, -inf, nan, nan, nan, nan, nan, nan]);
+        cost = 1e9;
+    end
+end
+
+% ---------- CSV append helpers ----------
+function append_cccv_row(fn, row)
+    % [C, t, s, cv_frac, E_Wh, Vdiff_min, Vdiff_max, T_avg, T_max]
+    T = table(row(1),row(2),row(3),row(4),row(5),row(6),row(7),row(8),row(9), ...
+        'VariableNames', {'C','t','s','cv_frac','E_Wh','Vdiff_min','Vdiff_max','T_avg','T_max'});
+    writetable(T, fn, 'WriteMode','Append');
+end
+
+function append_mscc4_row(fn, row)
+    % [C1 C2 C3 C4, t, s, cv_frac, E_Wh, Vdiff_min, Vdiff_max, T_avg, T_max]
+    T = table(row(1),row(2),row(3),row(4),row(5),row(6),row(7),row(8),row(9),row(10),row(11),row(12), ...
+        'VariableNames', {'C1','C2','C3','C4','t','s','cv_frac','E_Wh','Vdiff_min','Vdiff_max','T_avg','T_max'});
+    writetable(T, fn, 'WriteMode','Append');
+end
+
+function append_mscc2_row(fn, row)
+    % [C12 C34, t, s, cv_frac, E_Wh, Vdiff_min, Vdiff_max, T_avg, T_max]
+    T = table(row(1),row(2),row(3),row(4),row(5),row(6),row(7),row(8),row(9),row(10), ...
+        'VariableNames', {'C12','C34','t','s','cv_frac','E_Wh','Vdiff_min','Vdiff_max','T_avg','T_max'});
+    writetable(T, fn, 'WriteMode','Append');
+end
+
+% ---------- 온도 피크 취득 ----------
+function [T_avg_peak, T_max_peak] = get_T_peaks(model, dset)
+    T_avg_peak = nan; T_max_peak = nan;
+    try
+        G = mpheval(model,'T_avg','dataset',dset,'edim','domain','solnum','all');
+        T_avg_peak = max(G.d1(:),[],'omitnan');
+    catch, end
+    try
+        G = mpheval(model,'T_max','dataset',dset,'edim','domain','solnum','all');
+        T_max_peak = max(G.d1(:),[],'omitnan');
+    catch, end
+end
