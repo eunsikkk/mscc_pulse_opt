@@ -1,0 +1,302 @@
+% =========================================================================
+% Pareto 3D (t, s, T_avg) for: CCCV + MSCC4 + MSCC2
+% - run_* 폴더에서 각 로그를 읽어서 3D 파레토(최소화: t, -s, T_avg) 그림 저장
+% - 그림 저장 경로: G:\...\COMSOL\Figure\pareto_YYYYMMDD_HHMMSS\pareto3D_t_s_Tavg.png
+% - 토글: 최신 run_* 자동 선택 vs 대화형 선택 (use_latest)
+% =========================================================================
+clc; clear; close all;
+
+%% 0) 입력/출력 경로 --------------------------------------------------------
+base_dir = 'G:\공유 드라이브\Battery Software Group (2025)\Members\최은식\COMSOL\MSCC_optimization\MSCC_CCCV_opt';
+assert(isfolder(base_dir), '기본 폴더 없음: %s', base_dir);
+
+% === 토글 스위치: true면 최신 run_* 자동선택, false면 대화형 선택 ===
+use_latest = false;
+
+% Figure 저장 루트
+fig_base_dir = 'G:\공유 드라이브\Battery Software Group (2025)\Members\최은식\COMSOL\Figure';
+assert(isfolder(fileparts(fig_base_dir)) || isfolder(fig_base_dir), 'Figure 상위 폴더가 유효하지 않습니다.');
+ts = datestr(now,'yyyymmdd_HHMMSS');
+fig_out_dir = fullfile(fig_base_dir, ['pareto_' ts]);
+if ~isfolder(fig_out_dir), mkdir(fig_out_dir); end
+
+%% 1) run_* 폴더 선택 -------------------------------------------------------
+if use_latest
+    d = dir(fullfile(base_dir, 'run_*'));
+    assert(~isempty(d), 'run_* 폴더가 없습니다. 먼저 최적화 스크립트를 실행하세요.');
+    [~,ix] = max([d.datenum]);
+    run_dir = fullfile(base_dir, d(ix).name);
+else
+    run_dir = uigetdir(base_dir, '분석할 run_* 폴더를 선택하세요');
+    if isstring(run_dir), run_dir = char(run_dir); end
+    assert(~isequal(run_dir,0), '폴더 선택이 취소되었습니다.');
+    [~,selname] = fileparts(run_dir);
+    assert(startsWith(selname,'run_'), '선택한 폴더명이 run_* 형식이 아닙니다: %s', selname);
+end
+
+fprintf('Using run dir: %s\n', run_dir);
+
+%% 2) 로그 파일 경로 지정 (세 종류 모두) -----------------------------------
+cccv_log  = pick_one_file(run_dir, 'cccv_optimization_log_*.csv');
+mscc4_log = pick_one_file(run_dir, 'mscc4_optimization_log_*.csv');
+mscc2_log = pick_one_file(run_dir, 'mscc2_optimization_log_*.csv');
+
+fprintf('  CCCV  log: %s\n',  cccv_log);
+fprintf('  MSCC4 log: %s\n', mscc4_log);
+fprintf('  MSCC2 log: %s\n', mscc2_log);
+
+%% 3) 데이터 로드 & 컬럼 체크 ----------------------------------------------
+TC  = readtable(cccv_log);
+TM4 = readtable(mscc4_log);
+TM2 = readtable(mscc2_log);
+
+needCols = {'t','s','T_avg'};
+assert(all(ismember(needCols, TC.Properties.VariableNames )), 'CCCV 로그에 t/s/T_avg 컬럼이 없습니다.');
+assert(all(ismember(needCols, TM4.Properties.VariableNames)), 'MSCC4 로그에 t/s/T_avg 컬럼이 없습니다.');
+assert(all(ismember(needCols, TM2.Properties.VariableNames)), 'MSCC2 로그에 t/s/T_avg 컬럼이 없습니다.');
+
+% 데이터셋 패킹
+blue   = [0,115,194]/255;   % CCCV
+red    = [205,83,76]/255;   % MSCC4
+purple = [128,0,128]/255;   % MSCC2
+
+DS = struct('name',{},'t',{},'s',{},'T',{},'color',{});
+DS(end+1) = struct('name','CCCV',  't',TC.t,  's',TC.s,  'T',TC.T_avg,  'color',blue);
+DS(end+1) = struct('name','MSCC4', 't',TM4.t, 's',TM4.s, 'T',TM4.T_avg, 'color',red);
+DS(end+1) = struct('name','MSCC2', 't',TM2.t, 's',TM2.s, 'T',TM2.T_avg, 'color',purple);
+
+%% 4) 3D 파레토 (t, s, T_avg) — 프로토콜별로 각각 저장 -----------------------
+% 목적: 최소화 [t, -s, T_avg]  (즉, t 작게, s 크게, T_avg 작게)
+% 출력: pareto3D_CCCV.png, pareto3D_MSCC4.png, pareto3D_MSCC2.png
+
+for k = 1:numel(DS)
+    name = DS(k).name;
+    t = DS(k).t; s = DS(k).s; T = DS(k).T; c = DS(k).color;
+
+    f = figure(2013+k); clf; hold on; grid on; view(45,25);
+    set(gcf,'Color','w');
+
+    % 전체 샘플 점
+    scatter3(t, s, T, 18, c, 'filled', 'MarkerFaceAlpha',0.22, ...
+        'DisplayName', [name ' 샘플']);
+
+    % 파레토 점 (해당 프로토콜 데이터셋 내부에서만 계산)
+    F = [t, -s, T];                 % 모두 "작을수록 좋은" 형태
+    mask_nd = isNondominatedND(F);  % 비지배해
+    scatter3(t(mask_nd), s(mask_nd), T(mask_nd), 54, c, 'o', ...
+        'LineWidth',1.4, 'MarkerFaceColor','none', ...
+        'DisplayName', [name ' Pareto']);
+
+    xlabel('t (s)');
+    ylabel('s (V)  ↑');
+    zlabel('T_{avg} (K)');
+    title(sprintf('Pareto 3D — t vs s vs T_{avg} (%s)', name));
+    legend('Location','best'); set(gca,'FontSize',11);
+
+    % 저장
+    out_png = fullfile(fig_out_dir, ['pareto3D_' name '.png']);
+    export_png(f, out_png);
+    fprintf('Saved: %s\n', out_png);
+end
+
+%% ======================= Local helper functions ==========================
+function fpath = pick_one_file(folder, pattern)
+    L = dir(fullfile(folder, pattern));
+    assert(~isempty(L), '파일이 없습니다: %s', fullfile(folder, pattern));
+    [~,ix] = max([L.datenum]);           % 가장 최신 파일
+    fpath = fullfile(L(ix).folder, L(ix).name);
+end
+
+function export_png(fig_handle, outpath)
+    try
+        set(fig_handle, 'Color','w');
+        % 축 툴바 숨김 (가능하면)
+        axs = findall(fig_handle, 'Type', 'axes');
+        for ax = axs'
+            try, axtoolbar(ax,'Visible','off'); end %#ok<TRYNC>
+        end
+        exportgraphics(fig_handle, outpath, 'Resolution', 220);
+    catch ME
+        warning('PNG 저장 실패 (%s): %s', outpath, ME.message);
+    end
+end
+
+function mask_nd = isNondominatedND(F)
+% F: [N x M], 각 열은 "최소화" 대상.
+% 반환: 비지배(true)/지배(false)
+    N = size(F,1);
+    mask_nd = true(N,1);
+    for i = 1:N
+        if ~mask_nd(i), continue; end
+        for j = 1:N
+            if i==j, continue; end
+            % j가 i를 지배: 모든 목표에서 <= 이고, 적어도 하나는 <
+            if all(F(j,:) <= F(i,:)) && any(F(j,:) < F(i,:))
+                mask_nd(i) = false;
+                break;
+            end
+        end
+    end
+end
+
+
+
+%% 5) 최적 C-rate로 실제 시뮬레이션 & 시계열 플롯 저장 (phis-phil 사용) ========
+% - run_dir/run_summary_*.mat에서 최적값 로드 → 모델 실행 → t/E/I/(phis-phil)/T_avg/T_max 플롯
+fprintf('\n[SIM] 최적 C-rate 시뮬레이션 (phis-phil) 시작\n');
+
+import com.comsol.model.*
+import com.comsol.model.util.*
+ModelUtil.showProgress(true);
+
+% 5.1) 최적해 요약 MAT 로드
+summary_mat = pick_one_file(run_dir, 'run_summary_*.mat');
+S = load(summary_mat);
+C_cccv  = S.optimal_C_rate;           % scalar
+C_mscc4 = S.optimal_C_mscc4(:).';     % [C1 C2 C3 C4]
+C_mscc2 = S.optimal_C_mscc2(:).';     % [C12 C34]
+
+% 5.2) 모델 로드
+filepath = 'C:\Users\user\Downloads';
+filename = 'ES_MSCC_PC_1028_feedback_ver.mph';
+full_path = fullfile(filepath, filename);
+assert(isfile(full_path),'mph 파일 없음: %s', full_path);
+model = mphload(full_path);
+
+% 5.3) 러너: 주어진 프로토콜을 최적 C로 실행하고 시계열 반환 (CC/CV 구간만 사용)
+function R = run_and_eval(protocol, model, Cvals)
+    % ===== (0) 공통 출력 간격 설정 =====
+    dt_out = 10;   % [s]  ← 여기만 원하는 간격으로 바꾸면 됨 (예: 5, 2, 1 등)
+
+    % ===== (1) 파라미터 세팅 & 스터디/데이터셋 선택 =====
+    switch protocol
+        case 'CCCV'
+            model.param.set('C_rate', num2str(Cvals(1)));
+            studyTag = 'std1'; dset = 'dset1';
+        case 'MSCC4'
+            model.param.set('first_MSCC_Crate',  num2str(Cvals(1)));
+            model.param.set('second_MSCC_Crate', num2str(Cvals(2)));
+            model.param.set('third_MSCC_Crate',  num2str(Cvals(3)));
+            model.param.set('fourth_MSCC_Crate', num2str(Cvals(4)));
+            studyTag = 'std2'; dset = 'dset3';
+        case 'MSCC2' % [C12 C34] -> [C12 C12 C34 C34]
+            model.param.set('first_MSCC_Crate',  num2str(Cvals(1)));
+            model.param.set('second_MSCC_Crate', num2str(Cvals(1)));
+            model.param.set('third_MSCC_Crate',  num2str(Cvals(2)));
+            model.param.set('fourth_MSCC_Crate', num2str(Cvals(2)));
+            studyTag = 'std2'; dset = 'dset3';
+        otherwise
+            error('Unknown protocol');
+    end
+
+    % ===== (2) 1차 실행: t_end 추정 =====
+    model.study(studyTag).run();
+    Dt = mpheval(model, {'t','liion.cdc1.CC_CH','liion.cdc1.CV_CH'}, ...
+                 'dataset',dset,'edim','point','selection',2,'solnum','all');
+    t_all = Dt.d1; cc = Dt.d2; cv = Dt.d3;
+    idx_chg = (cc==1) | (cv==1);
+    if any(idx_chg), t_end = t_all(find(idx_chg,1,'last'));
+    else,            t_end = t_all(end);
+    end
+    % 출력 끝시간을 dt_out 배수로 반올림(올림)
+    t_end_rounded = ceil(t_end/dt_out)*dt_out;
+
+    % ===== (3) tlist 세팅 (출력 시간 간격 10 s) =====
+    set_tlist_safe(model, studyTag, sprintf('range(0,%g,%g)', dt_out, t_end_rounded));
+
+    % (옵션) 내부 스텝까지 강제로 맞추고 싶다면 아래 줄 주석 해제
+    % set_solver_strict_tlist(model, studyTag, sprintf('range(0,%g,%g)', dt_out, t_end_rounded));
+
+    % ===== (4) 2차 실행: 최종 10 s 간격 출력 =====
+    model.study(studyTag).run();
+
+    % ===== (5) 데이터 취득 =====
+    expr = {'t','E_cell','liion.cdc1.Icell','phis-phil','T_avg','T_max','liion.cdc1.CC_CH','liion.cdc1.CV_CH'};
+    D = mpheval(model, expr, 'dataset',dset,'edim','point','selection',2,'solnum','all');
+
+    t  = D.d1;  E  = D.d2;  I  = D.d3;  v = D.d4;
+    Ta = toCol(D,5); Tm = toCol(D,6);
+    cc = D.d7;  cv = D.d8;
+    idx = (cc==1) | (cv==1); if ~any(idx), idx = true(size(t)); end
+
+    R = struct('t',t(idx),'E',E(idx),'I',I(idx), ...
+               'vdiff',v(idx),'Tavg',Ta(idx),'Tmax',Tm(idx));
+end
+
+function col = toCol(D, k)
+    try col = D.(['d' num2str(k)]); catch, col = nan(size(D.d1)); end
+end
+
+function set_tlist_safe(model, studyTag, tlist_str)
+    % Study 단계(time step feature)에 tlist 설정 시도
+    tried = false;
+    for cand = {'time','time1','time2','step1','step2'}
+        try
+            model.study(studyTag).feature(char(cand)).set('tlist', tlist_str);
+            tried = true; break;
+        catch
+        end
+    end
+    % Solver 단계(time-dependent feature)에도 설정 시도 (보통 'sol1' 아래 't1' 등)
+    for solCand = {'sol1','sol2'}
+        for featCand = {'t1','t2','time','time1'}
+            try
+                model.sol(char(solCand)).feature(char(featCand)).set('tlist', tlist_str);
+            catch
+            end
+        end
+    end
+    if ~tried
+        warning('tlist 설정 실패: study=%s (기본 설정으로 계속 진행)', studyTag);
+    end
+end
+
+
+% 5.4) 실행
+R_cccv  = run_and_eval('CCCV',  model, C_cccv);
+R_mscc4 = run_and_eval('MSCC4', model, C_mscc4);
+R_mscc2 = run_and_eval('MSCC2', model, C_mscc2);
+
+% 5.5) 색상 (Pareto 팔레트와 동일)
+blue   = [0,115,194]/255;   % CCCV
+red    = [205,83,76]/255;   % MSCC4
+purple = [128,0,128]/255;   % MSCC2
+
+% 5.6) Figure 1 — 전압/전류 vs time (yyaxis)
+f1 = figure(4101); clf; set(gcf,'Color','w'); hold on; grid on;
+title('Voltage & Current vs time (Optimal C)');
+yyaxis left;  plot(R_cccv.t,  R_cccv.E,  '-',  'LineWidth',1.5, 'Color',blue);   ylabel('E_{cell} (V)');
+yyaxis right; plot(R_cccv.t,  R_cccv.I,  '--', 'LineWidth',1.2, 'Color',blue);   ylabel('I_{cell} (A)');
+yyaxis left;  plot(R_mscc4.t, R_mscc4.E, '-',  'LineWidth',1.5, 'Color',red);
+yyaxis right; plot(R_mscc4.t, R_mscc4.I, '--', 'LineWidth',1.2, 'Color',red);
+yyaxis left;  plot(R_mscc2.t, R_mscc2.E, '-',  'LineWidth',1.5, 'Color',purple);
+yyaxis right; plot(R_mscc2.t, R_mscc2.I, '--', 'LineWidth',1.2, 'Color',purple);
+xlabel('t (s)');
+legend({'E CCCV','I CCCV','E MSCC4','I MSCC4','E MSCC2','I MSCC2'}, 'Location','best');
+export_png(f1, fullfile(fig_out_dir, 'timeseries_voltage_current.png'));
+
+% 5.7) Figure 2 — (phis-phil) vs time  ← 요청사항 반영
+f2 = figure(4102); clf; set(gcf,'Color','w'); hold on; grid on;
+plot(R_cccv.t,  R_cccv.vdiff,  'LineWidth',1.6, 'Color',blue);
+plot(R_mscc4.t, R_mscc4.vdiff, 'LineWidth',1.6, 'Color',red);
+plot(R_mscc2.t, R_mscc2.vdiff, 'LineWidth',1.6, 'Color',purple);
+xlabel('t (s)'); ylabel('\phi_s - \phi_l (V)');
+title('Overpotential ( \phi_s - \phi_l ) vs time (Optimal C)');
+legend({'CCCV','MSCC4','MSCC2'}, 'Location','best');
+export_png(f2, fullfile(fig_out_dir, 'timeseries_overpotential.png'));
+
+% 5.8) Figure 3 — T_{avg}, T_{max} vs time
+f3 = figure(4103); clf; set(gcf,'Color','w'); hold on; grid on;
+plot(R_cccv.t,  R_cccv.Tavg,  '-',  'LineWidth',1.6, 'Color',blue);
+plot(R_mscc4.t, R_mscc4.Tavg, '-',  'LineWidth',1.6, 'Color',red);
+plot(R_mscc2.t, R_mscc2.Tavg, '-',  'LineWidth',1.6, 'Color',purple);
+plot(R_cccv.t,  R_cccv.Tmax,  '--', 'LineWidth',1.4, 'Color',blue);
+plot(R_mscc4.t, R_mscc4.Tmax, '--', 'LineWidth',1.4, 'Color',red);
+plot(R_mscc2.t, R_mscc2.Tmax, '--', 'LineWidth',1.4, 'Color',purple);
+xlabel('t (s)'); ylabel('Temperature (K)');
+title('Temperature vs time (Optimal C)');
+legend({'T_{avg} CCCV','T_{avg} MSCC4','T_{avg} MSCC2', ...
+        'T_{max} CCCV','T_{max} MSCC4','T_{max} MSCC2'}, 'Location','best');
+export_png(f3, fullfile(fig_out_dir, 'timeseries_temperature.png'));
+
+fprintf('[SIM] 완료: PNG 3종 저장됨 → %s\n', fig_out_dir);
